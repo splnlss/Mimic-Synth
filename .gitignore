@@ -1,0 +1,54 @@
+# Dataset output — large binary/audio files, not versioned
+s02_capture/data/
+s03_dataset/data/
+
+# Test reports (generated artefacts)
+tests/reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Audio / binary artefacts (if generated elsewhere)
+*.wav
+*.flac
+*.aif
+*.aiff
+*.npy
+*.parquet

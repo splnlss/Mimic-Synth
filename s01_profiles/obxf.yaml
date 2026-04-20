@@ -1,0 +1,124 @@
+synth:
+  id: obxf
+  name: "Surge Synth Team OB-Xf"
+  version: "1.0.3"
+  transport: vst_host
+  plugin_path_macos:   "/Library/Audio/Plug-Ins/VST3/OB-Xf.vst3"
+  plugin_path_windows: "C:/Program Files/Common Files/VST3/OB-Xf.vst3"
+  plugin_path_linux:   "~/.vst3/OB-Xf.vst3"
+  parameter_encoding: vst_automation
+
+# 15 continuous params (v1 subset). Names confirmed against OB-Xf v1.0.3 via
+# enumerate_params.py — OB-Xf uses full display names, not short OB-Xd names.
+parameters:
+  "Osc 1 Pitch":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.6
+  "Osc 2 Detune":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.6
+  "Osc 1 Volume":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.7
+  "Osc Pulsewidth":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.5
+  "Cross Modulation":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.5
+  "Filter Cutoff":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    log_scale: true
+    importance: 1.0
+  "Filter Resonance":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.95
+  "Filter Env Amount":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.85
+  "Filter Mode":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.8
+  "Amp Env Attack":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.7
+  "Amp Env Decay":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.7
+  "Amp Env Release":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.6
+  "LFO 1 Rate":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.5
+  "LFO 1 to Osc 1 Pitch":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.4
+  "LFO 1 to Filter Cutoff":
+    encoding: vst
+    range: [0.0, 1.0]
+    continuous: true
+    importance: 0.4
+
+probe:
+  notes: [36, 48, 60, 72, 84]
+  velocity: 100
+  hold_sec: 1.5
+  release_sec: 1.0   # documents release tail; render_sec = hold_sec + release_sec
+  render_sec: 2.5
+  sample_rate: 48000
+
+reset:
+  "Osc 1 Pitch": 0.5
+  "Osc 2 Detune": 0.5
+  "Osc 1 Volume": 0.7
+  "Osc 2 Volume": 0.3
+  "Osc 1 Saw Wave": 1.0       # saw on
+  "Osc 1 Pulse Wave": 0.0     # pulse off
+  "Osc Pulsewidth": 0.5
+  "Cross Modulation": 0.0
+  "Filter Cutoff": 0.7
+  "Filter Resonance": 0.2
+  "Filter Env Amount": 0.3
+  "Filter Mode": 0.0           # 0 = low-pass
+  "High Quality Mode": 1.0
+  "Amp Env Attack": 0.0
+  "Amp Env Decay": 0.3
+  "Amp Env Sustain": 1.0
+  "Amp Env Release": 0.2
+  "Filter Env Attack": 0.0
+  "Filter Env Decay": 0.3
+  "Filter Env Sustain": 0.8
+  "Filter Env Release": 0.2
+  "LFO 1 Rate": 0.3
+  "LFO 1 to Osc 1 Pitch": 0.0
+  "LFO 1 to Filter Cutoff": 0.0
+  "Unison Detune": 0.1

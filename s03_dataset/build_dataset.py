@@ -1,0 +1,128 @@
+"""
+Bucket 3 dataset builder.
+
+Wraps the V1 capture rig with:
+- Scrambled Sobol cold-start sampling (`s03_dataset.sampling.cold_start_vectors`)
+- Per-capture quality gates (`s03_dataset.quality.analyse`)
+- Reproducibility manifest (`s03_dataset.manifest`)
+
+Usage:
+    python -m s03_dataset.build_dataset --profile s01_profiles/obxf.yaml --m 10 --out data/
+    # 2**10 = 1024 vectors * len(notes) captures
+
+This imports capture_v1 lazily so unit tests that don't need DawDreamer
+can still import the module.
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import soundfile as sf
+import yaml
+from tqdm import tqdm
+
+from .sampling import cold_start_vectors, apply_importance
+from .quality import analyse
+from .manifest import Manifest, Phase, Counts, new_manifest, write_manifest, MANIFEST_FILENAME
+
+
+def _list_modulated(profile: dict) -> list[str]:
+    return [n for n, s in profile["parameters"].items() if s.get("importance", 0) > 0]
+
+
+def build_dataset(
+    profile_path: Path | str,
+    out_dir: Path | str,
+    m: int,
+    seed: int = 0,
+    importance_mode: str = "filter",
+) -> Manifest:
+    """Render 2**m * len(notes) captures into out_dir and write manifest.yaml."""
+    import dawdreamer as daw                              # noqa: local import
+    from capture_v1 import (                              # noqa: local import
+        resolve_plugin_path, build_name_index, apply_params, reset, render_one,
+        SAMPLE_RATE, BUFFER_SIZE,
+    )
+
+    out_dir = Path(out_dir)
+    wav_dir = out_dir / "wav"
+    wav_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(profile_path) as f:
+        profile = yaml.safe_load(f)
+    modulated = _list_modulated(profile)
+    notes = profile["probe"]["notes"]
+
+    engine = daw.RenderEngine(SAMPLE_RATE, BUFFER_SIZE)
+    synth = engine.make_plugin_processor("obxf", resolve_plugin_path(profile))
+    name_idx = build_name_index(synth)
+    engine.load_graph([(synth, [])])
+
+    vectors = cold_start_vectors(m=m, d=len(modulated), seed=seed)
+    manifest = new_manifest(
+        seed=seed, profile=profile,
+        importance_mode=importance_mode,
+        log_scale_applied=any(profile["parameters"][n].get("log_scale") for n in modulated),
+    )
+    manifest.phases.append(Phase(name="cold_start", n=len(vectors), seed=seed))
+    counts = Counts()
+    rows = []
+
+    for i, u_row in enumerate(tqdm(vectors, desc="capturing")):
+        reset(synth, profile, name_idx)
+        params = apply_importance(u_row, modulated, profile, mode=importance_mode)
+        params_dict = dict(params)
+        apply_params(synth, params_dict, profile, name_idx)
+
+        for note in notes:
+            audio = render_one(engine, synth, note, profile)
+            counts.rendered += 1
+            stats = analyse(
+                audio, sample_rate=SAMPLE_RATE,
+                hold_sec=float(profile["probe"]["hold_sec"]),
+                release_sec=float(profile["probe"]["release_sec"]),
+            )
+            if stats.silent:    counts.silent += 1
+            if stats.clipped:   counts.clipped += 1
+            if stats.stuck:     counts.stuck += 1
+            if stats.prev_bleed: counts.prev_bleed += 1
+            if not stats.is_valid():
+                continue
+            counts.valid += 1
+
+            h = hashlib.md5(u_row.tobytes() + bytes([note])).hexdigest()[:12]
+            wav_path = wav_dir / f"{h}_n{note}.wav"
+            sf.write(wav_path, audio, SAMPLE_RATE)
+            rows.append({
+                "hash": h, "note": note, "wav": str(wav_path.relative_to(out_dir)),
+                **{f"p_{k}": v for k, v in params_dict.items()},
+            })
+
+    pd.DataFrame(rows).to_parquet(out_dir / "samples.parquet")
+    manifest.counts = counts
+    write_manifest(out_dir / MANIFEST_FILENAME, manifest)
+    return manifest
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--profile", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--m", type=int, required=True, help="Sobol exponent — generates 2**m vectors")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--importance-mode", choices=["filter", "scale"], default="filter")
+    args = ap.parse_args()
+    manifest = build_dataset(
+        args.profile, args.out, m=args.m, seed=args.seed,
+        importance_mode=args.importance_mode,
+    )
+    print(f"Done. Rendered={manifest.counts.rendered} valid={manifest.counts.valid}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

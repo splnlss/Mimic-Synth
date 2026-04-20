@@ -1,0 +1,9 @@
+dawdreamer
+numpy
+scipy
+soundfile
+pyarrow
+pyyaml
+pandas
+tqdm
+pytest
