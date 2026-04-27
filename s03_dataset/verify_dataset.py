@@ -112,11 +112,14 @@ def verify_row(row: pd.Series, dataset_dir: Path, profile: dict) -> tuple[Captur
     if "_n" in wav_path.name and str(row["hash"]) not in wav_path.name:
         issues.append(f"hash_filename_mismatch:{wav_path}:expected={row['hash']}")
 
+    self_noise = float(row.get("self_noise", 0.0))
     stats = analyse(
         audio,
         sample_rate=expected_sr,
         hold_sec=float(profile["probe"]["hold_sec"]),
         release_sec=float(profile["probe"]["release_sec"]),
+        pre_roll_sec=float(profile["probe"].get("pre_roll_sec", 0.0)),
+        self_noise=self_noise,
     )
     return stats, issues
 

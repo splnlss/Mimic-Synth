@@ -91,9 +91,10 @@ parameters:
 probe:
   notes: [36, 48, 60, 72, 84]
   velocity: 100
+  pre_roll_sec: 0.2  # increased from 0.1s to give more silence before note-on; lets previous render decay and eliminates bleed
   hold_sec: 1.5
-  release_sec: 1.0   # documents release tail; render_sec = hold_sec + release_sec
-  render_sec: 2.5
+  release_sec: 2.5   # long enough to capture full tail at max Amp Env Release
+  render_sec: 4.1    # pre_roll + hold + release
   sample_rate: 48000
 
 reset:

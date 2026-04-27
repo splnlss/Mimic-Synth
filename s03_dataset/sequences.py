@@ -105,9 +105,10 @@ def render_sequence(
     total_sec = T / float(control_hz)
     synth.clear_midi()
     vel = int(profile["probe"]["velocity"])
+    pre_roll = float(profile["probe"].get("pre_roll_sec", 0.0))
     # Hold the note slightly shorter than the render so the final release is captured.
-    hold = max(0.05, total_sec - 0.2)
-    synth.add_midi_note(note, vel, 0.0, hold)
+    hold = max(0.05, total_sec - pre_roll - 0.2)
+    synth.add_midi_note(note, vel, pre_roll, hold)
 
     for i, name in enumerate(modulated):
         values = trajectory[:, i].astype(np.float32)
@@ -134,7 +135,7 @@ def build_sequence_dataset(
 ) -> Manifest:
     """Render 2**(m-1) sequences into out_dir. Writes sequences.parquet + wav + params."""
     import dawdreamer as daw                              # noqa: local import
-    from capture_v1 import (                              # noqa: local import
+    from s02_capture.capture_v1_2 import (                 # noqa: local import
         resolve_plugin_path, build_name_index, reset,
         SAMPLE_RATE, BUFFER_SIZE,
     )

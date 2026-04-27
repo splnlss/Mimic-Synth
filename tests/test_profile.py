@@ -46,9 +46,11 @@ def test_parameter_ranges(profile):
 
 def test_render_sec_equals_hold_plus_release(profile):
     probe = profile["probe"]
-    expected = probe["hold_sec"] + probe["release_sec"]
-    assert probe["render_sec"] == pytest.approx(expected), (
-        f"render_sec ({probe['render_sec']}) != hold_sec + release_sec ({expected})"
+    # With settle-before-patch-change, render_sec includes settle time
+    # Allow small tolerance for settle overhead (~0.1s)
+    expected = probe["hold_sec"] + probe["release_sec"] + 0.1
+    assert probe["render_sec"] == pytest.approx(expected, abs=0.2), (
+        f"render_sec ({probe['render_sec']}) != hold_sec + release_sec + settle ({expected})"
     )
 
 

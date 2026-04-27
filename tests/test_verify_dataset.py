@@ -7,7 +7,7 @@ import pytest
 
 from s03_dataset.verify_dataset import verify_dataset, print_report
 
-SR = 44100
+SR = 48000
 
 
 @pytest.fixture

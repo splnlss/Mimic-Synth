@@ -10,6 +10,7 @@ import argparse
 import platform
 from pathlib import Path
 import dawdreamer as daw
+from defaults import SAMPLE_RATE, BUFFER_SIZE
 
 PLUGIN_PATHS = {
     "Darwin":  "/Library/Audio/Plug-Ins/VST3/OB-Xf.vst3",
@@ -27,7 +28,7 @@ def main():
     if not plugin_path.exists():
         raise FileNotFoundError(f"OB-Xf not found at {plugin_path}")
 
-    engine = daw.RenderEngine(44100, 512)
+    engine = daw.RenderEngine(SAMPLE_RATE, BUFFER_SIZE)
     synth = engine.make_plugin_processor("obxf", str(plugin_path))
     n = synth.get_plugin_parameter_size()
 

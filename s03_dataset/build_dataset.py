@@ -1,7 +1,7 @@
 """
 Bucket 3 dataset builder.
 
-Wraps the V1 capture rig with:
+Wraps the capture rig (capture_v1_2) with:
 - Scrambled Sobol cold-start sampling (`s03_dataset.sampling.cold_start_vectors`)
 - Per-capture quality gates (`s03_dataset.quality.analyse`)
 - Reproducibility manifest (`s03_dataset.manifest`)
@@ -10,7 +10,7 @@ Usage:
     python -m s03_dataset.build_dataset --profile s01_profiles/obxf.yaml --m 10 --out data/
     # 2**10 = 1024 vectors * len(notes) captures
 
-This imports capture_v1 lazily so unit tests that don't need DawDreamer
+This imports capture_v1_2 lazily so unit tests that don't need DawDreamer
 can still import the module.
 """
 from __future__ import annotations
@@ -43,7 +43,7 @@ def build_dataset(
 ) -> Manifest:
     """Render 2**m * len(notes) captures into out_dir and write manifest.yaml."""
     import dawdreamer as daw                              # noqa: local import
-    from capture_v1 import (                              # noqa: local import
+    from s02_capture.capture_v1_2 import (                # noqa: local import
         resolve_plugin_path, build_name_index, apply_params, reset, render_one,
         SAMPLE_RATE, BUFFER_SIZE,
     )
@@ -85,6 +85,7 @@ def build_dataset(
                 audio, sample_rate=SAMPLE_RATE,
                 hold_sec=float(profile["probe"]["hold_sec"]),
                 release_sec=float(profile["probe"]["release_sec"]),
+                pre_roll_sec=float(profile["probe"].get("pre_roll_sec", 0.0)),
             )
             if stats.silent:    counts.silent += 1
             if stats.clipped:   counts.clipped += 1

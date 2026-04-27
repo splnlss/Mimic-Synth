@@ -6,7 +6,7 @@ from s03_dataset.quality import (
     is_silent, is_clipped, is_stuck_note, has_prev_note_bleed, analyse,
 )
 
-SR = 44100
+SR = 48000
 
 
 def _tone(freq, dur_sec, amp=0.3, sr=SR):

@@ -1,17 +1,14 @@
 """
-Unit tests for pure-Python functions in capture_v1.py — no DawDreamer required.
+Unit tests for pure-Python functions in capture_v1_2.py — no DawDreamer required.
 """
 import hashlib
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import yaml
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from capture_v1 import apply_params, sample_vectors, resolve_plugin_path, load_profile
+from s02_capture.capture_v1_2 import apply_params, sample_vectors, resolve_plugin_path, load_profile
 
 PROFILE_PATH = Path(__file__).parent.parent / "s01_profiles" / "obxf.yaml"
 
@@ -24,25 +21,29 @@ def profile():
 # ── sample_vectors ────────────────────────────────────────────────────────────
 
 def test_sample_vectors_shape():
-    vecs = sample_vectors(n=16, modulated_params=["a", "b", "c"])
+    # m=4 gives 2^4=16 samples
+    vecs = sample_vectors(m=4, modulated_params=["a", "b", "c"])
     assert vecs.shape == (16, 3)
 
 
 def test_sample_vectors_range():
-    vecs = sample_vectors(n=64, modulated_params=list("abcde"))
+    # m=6 is too large (2^6=64), use m=3 for 8 samples
+    vecs = sample_vectors(m=3, modulated_params=list("abcde"))
     assert vecs.min() >= 0.0
     assert vecs.max() <= 1.0
 
 
 def test_sample_vectors_deterministic():
-    v1 = sample_vectors(n=32, modulated_params=["x", "y"], seed=42)
-    v2 = sample_vectors(n=32, modulated_params=["x", "y"], seed=42)
+    # m=3 gives 8 samples
+    v1 = sample_vectors(m=3, modulated_params=["x", "y"], seed=42)
+    v2 = sample_vectors(m=3, modulated_params=["x", "y"], seed=42)
     np.testing.assert_array_equal(v1, v2)
 
 
 def test_sample_vectors_different_seeds():
-    v1 = sample_vectors(n=32, modulated_params=["x", "y"], seed=0)
-    v2 = sample_vectors(n=32, modulated_params=["x", "y"], seed=1)
+    # m=3 gives 8 samples
+    v1 = sample_vectors(m=3, modulated_params=["x", "y"], seed=0)
+    v2 = sample_vectors(m=3, modulated_params=["x", "y"], seed=1)
     assert not np.array_equal(v1, v2)
 
 

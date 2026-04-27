@@ -4,24 +4,21 @@ Run with: pytest tests/test_integration.py -v -m integration
 
 These tests load the actual VST and render audio, so they take a few seconds.
 """
-import sys
 import platform
 from pathlib import Path
 import numpy as np
 import pytest
 import yaml
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from capture_v1 import (
+from s02_capture.capture_v1_2 import (
     load_profile, resolve_plugin_path, build_name_index,
     apply_params, reset, render_one,
+    SAMPLE_RATE, BUFFER_SIZE,
 )
 
 pytestmark = pytest.mark.integration
 
 PROFILE_PATH = Path(__file__).parent.parent / "s01_profiles" / "obxf.yaml"
-SAMPLE_RATE = 44100
-BUFFER_SIZE = 512
 
 
 @pytest.fixture(scope="module")
