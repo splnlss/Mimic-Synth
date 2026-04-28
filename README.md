@@ -58,18 +58,33 @@ Key capture features (v1.2):
 
 ### 3. Build the dataset (S03)
 
-Wraps the capture rig with scrambled Sobol sampling, quality gates, and a reproducibility manifest.
+Two modes: **live capture** (renders from scratch) or **post-hoc** (reads existing capture, applies quality gates + manifest).
+
+#### Post-hoc (recommended after running capture_v1_2.py)
+
+Reads the existing `samples.parquet` + WAVs, runs quality gates, copies valid captures, and writes a manifest. No DawDreamer required.
 
 ```bash
 .venv/bin/python -m s03_dataset.build_dataset \
     --profile s01_profiles/obxf.yaml \
-    --m 10 \
+    --from-capture s02_capture/data/ \
     --out s03_dataset/data/
 ```
 
-`--m 10` generates 2^10 = 1,024 vectors. Use `--m 14` (~16k) or higher for production runs.
+#### Live capture (renders from scratch)
 
-Optional flags:
+Delegates to `capture_v1_2.capture_vector()` with importance weighting, quality gates, and manifest.
+
+```bash
+.venv/bin/python -m s03_dataset.build_dataset \
+    --profile s01_profiles/obxf.yaml \
+    --m 14 \
+    --out s03_dataset/data/
+```
+
+`--m 14` generates 2^14 = 16,384 vectors. Use `--m 10` (1,024) for smoke tests.
+
+Optional flags (live capture only):
 - `--seed INT` -- random seed (default `0`)
 - `--importance-mode filter|scale` -- how importance weights are applied (default `filter`)
 
