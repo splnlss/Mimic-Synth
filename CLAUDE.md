@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**MimicSynth** (`MimicSynth/`) is an ML audio dataset pipeline that captures synthesizer parameter-timbre mappings. It renders parameter vectors through a VST plugin (OB-Xf) via DawDreamer and produces labeled WAV datasets for training inverse models. The pipeline is stage-based, with directories prefixed `s01_`, `s02_`, `s03_`.
+**MimicSynth** (`MimicSynth/`) is an ML audio dataset pipeline that captures synthesizer parameter-timbre mappings. It renders parameter vectors through a VST plugin (OB-Xf) via DawDreamer and produces labeled WAV datasets for training inverse models. The pipeline is stage-based, with directories prefixed `s01_` through `s04_`.
 
 ## Common Commands
 
@@ -72,6 +72,7 @@ cd s02_capture && ../.venv/bin/python capture_v1_2.py
 - **Self-noise baseline**: `measure_self_noise()` renders 200ms with no MIDI after each patch load. Stored in parquet as `self_noise`. Used by both the settle loop (adaptive threshold) and the bleed detector (threshold floor) to handle patches that self-oscillate or have LFO artifacts.
 - **Profile importance field**: `importance: 0` excludes a parameter from sampling entirely. Values 0–1 control sampling density.
 - **Sample rate**: Standardized at 48 kHz.
+- **Checkpoint/resume pattern**: Long-running scripts (`capture_v1_2.py`, `index_dataset.py`) checkpoint periodically and prompt `[c]ontinue / [o]verwrite / [a]bort` on restart when prior output exists. New scripts that process the full dataset should follow this pattern.
 - **EnCodec embedding**: 48 kHz model produces 128-d latents at 150 Hz frame rate (not 75 Hz — that's the 24 kHz model). Pre-quantiser continuous latents via `model.encoder(x)`, not quantised codes. Latents are unbounded (not L2-normalised) — do not normalise to unit sphere.
 
 ### Data flow
@@ -88,8 +89,9 @@ obxf.yaml → sampling.py (Sobol vectors) → capture_v1_2.py (DawDreamer render
 
 ## Testing
 
-- Unit tests in `tests/` cover sampling, quality, manifest, sequences, and capture logic
+- Unit tests in `tests/` cover sampling, quality, manifest, sequences, capture logic, embeddings, and the embedding verifier
 - Integration tests (`test_integration.py`) require DawDreamer + OB-Xf VST installed; marked with `@pytest.mark.integration`
+- Embed tests (`test_embed.py`, `test_embed_index.py`) use synthetic tones — no capture data or GPU required
 - Quality gate thresholds in `quality.py` are tuned for specific audio characteristics — don't change without understanding the capture pipeline
 
 ## External References
