@@ -1,6 +1,7 @@
 # Dataset output — large binary/audio files, not versioned
 s02_capture/data/
 s03_dataset/data/
+s04_embed/data/
 
 # Test reports (generated artefacts)
 tests/reports/

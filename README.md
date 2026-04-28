@@ -2,13 +2,14 @@
 
 A pipeline for building audio datasets from synthesizers, designed to train models that learn the parameter-to-timbre mapping of a synth. Currently targets the [OB-Xf](https://github.com/surge-synthesizer/OB-Xf) (free, open-source OB-Xa emulation) via DawDreamer, but the architecture is designed to extend to ASIO audio interfaces and hardware/analog synths with MIDI.
 
-The pipeline has three stages:
+The pipeline has four stages (so far):
 
 | Stage | Folder | Purpose |
 |---|---|---|
 | S01 | `s01_profiles/` | Synth profile -- parameter definitions, importance weights, probe config |
 | S02 | `s02_capture/` | Capture rig -- renders (param vector, note) to WAV via DawDreamer |
 | S03 | `s03_dataset/` | Dataset builder -- Sobol sampling, quality gates, manifest, verifier |
+| S04 | `s04_embed/` | Audio embedding -- EnCodec 48 kHz pre-quantiser latents (128-d) |
 
 ---
 
@@ -109,7 +110,36 @@ To dump a CSV of all failed captures:
 
 Report is written to `tests/reports/verify_dataset/data_<name>_<HHMMSS>.csv`.
 
-### 5. Build sequence data (optional, for temporal models)
+### 5. Embed the dataset (S04)
+
+Pre-computes EnCodec embeddings for every capture, producing a `encodec_embeddings.npy` file aligned 1-to-1 with `samples.parquet`. No DawDreamer required.
+
+```bash
+.venv/bin/python -m s04_embed.index_dataset \
+    --dataset s02_capture/data/ \
+    --out s04_embed/data/ \
+    --pool mean
+```
+
+The script checkpoints every 500 rows. If interrupted, re-run and choose **[c]ontinue** to resume where it left off.
+
+Options:
+- `--pool mean` -- 128-d time-averaged vector (default, recommended for surrogate training)
+- `--pool meanstd` -- 256-d vector (mean + std concatenated, richer but larger)
+
+The embedder uses the EnCodec 48 kHz model's continuous pre-quantiser latents (not quantised codes). The checkpoint (~80 MB) downloads automatically on first run.
+
+To verify the embeddings:
+
+```bash
+.venv/bin/python -m s04_embed.verify_embeddings \
+    --embeddings s04_embed/data/encodec_embeddings.npy \
+    --dataset s02_capture/data/
+```
+
+Add `--spot-check` to run a nearest/farthest neighbor quality check (should show similar-sounding captures as nearest neighbors).
+
+### 6. Build sequence data (optional, for temporal models)
 
 Generates interpolated parameter trajectories for training frame-to-frame dynamics.
 
@@ -172,6 +202,12 @@ s03_dataset/
   sequences.py           # Sequence/trajectory dataset builder
   verify_dataset.py      # Post-hoc dataset auditor
 
+s04_embed/
+  embed.py               # Embedder class (EnCodec + multi-res STFT)
+  index_dataset.py       # Pre-compute embeddings CLI (checkpoint/resume)
+  verify_embeddings.py   # Post-hoc embedding auditor
+  data/                  # Output: encodec_embeddings.npy (gitignored)
+
 tests/
   test_quality.py
   test_sampling.py
@@ -180,6 +216,8 @@ tests/
   test_verify_dataset.py
   test_capture_unit.py
   test_capture_v1_2.py
+  test_embed.py
+  test_embed_index.py
   test_integration.py
   reports/               # Generated failure CSVs (gitignored)
 ```

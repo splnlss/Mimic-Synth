@@ -7,3 +7,6 @@ pyyaml
 pandas
 tqdm
 pytest
+torch
+encodec
+auraloss
