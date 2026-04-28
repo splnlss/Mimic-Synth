@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 SAMPLE_RATE = 48000
 BUFFER_SIZE = 512
-M = 10                       # Sobol exponent: 2^M vectors (10 → 1,024; use 14 for production)
+M = 14                       # Sobol exponent: 2^M vectors (14 → 16,384 vectors)
 PROFILE_PATH = "../s01_profiles/obxf.yaml"
 OUT_DIR = Path("data")
 WAV_DIR = OUT_DIR / "wav"
@@ -154,6 +154,68 @@ def sample_vectors(m, modulated_params, seed=0):
     d = len(modulated_params)
     sobol = Sobol(d=d, scramble=True, seed=seed)
     return sobol.random_base2(m=m)
+
+
+def capture_vector(engine, synth, vec, notes, profile, name_idx,
+                   modulated, played_notes_prev=None):
+    """Capture one parameter vector across all notes.
+
+    Handles the full v1.2 lifecycle: settle previous patch, load new patch,
+    measure self-noise, settle between notes, hard_reset fallback.
+
+    Args:
+        played_notes_prev: notes played by the previous vector (for settle).
+            Pass None or [] for the first vector.
+
+    Returns:
+        list of dicts (one per successfully rendered note), each containing:
+            hash, note, audio (np.ndarray), self_noise, params_dict
+        Plus an int count of unsettled events.
+    """
+    unsettled = 0
+
+    # Settle previous patch's tail
+    if played_notes_prev:
+        settled_sec = settle(engine, synth, played_notes_prev)
+        if settled_sec >= SETTLE_MAX_SEC:
+            unsettled += 1
+            hard_reset(engine, synth)
+
+    # Load new patch
+    reset(synth, profile, name_idx)
+    params_dict = dict(zip(modulated, vec))
+    apply_params(synth, params_dict, profile, name_idx)
+
+    # Measure self-noise
+    self_noise = measure_self_noise(engine, synth)
+    effective_threshold = max(SETTLE_THRESHOLD, self_noise * 2.0)
+
+    results = []
+    last_note = None
+    for note in notes:
+        # Settle between notes within this vector
+        if last_note is not None:
+            settled_sec = settle(engine, synth, [last_note],
+                                 threshold=effective_threshold)
+            if settled_sec >= SETTLE_MAX_SEC:
+                unsettled += 1
+                hard_reset(engine, synth, threshold=effective_threshold)
+                reset(synth, profile, name_idx)
+                apply_params(synth, params_dict, profile, name_idx)
+
+        audio = render_one(engine, synth, note, profile)
+        last_note = note
+
+        h = hashlib.md5(vec.tobytes() + bytes([note])).hexdigest()[:12]
+        results.append({
+            "hash": h,
+            "note": note,
+            "audio": audio,
+            "self_noise": self_noise,
+            "params_dict": params_dict,
+        })
+
+    return results, unsettled
 
 
 def _prompt_resume_or_overwrite(n_rows: int) -> str:

@@ -1,21 +1,18 @@
 """
 Bucket 3 dataset builder.
 
-Wraps the capture rig (capture_v1_2) with:
-- Scrambled Sobol cold-start sampling (`s03_dataset.sampling.cold_start_vectors`)
-- Per-capture quality gates (`s03_dataset.quality.analyse`)
-- Reproducibility manifest (`s03_dataset.manifest`)
+Delegates capture to capture_v1_2.capture_vector() so all settle, self-noise,
+and hard_reset logic lives in one place. This module adds:
+- Scrambled Sobol cold-start sampling with importance weighting
+- Per-capture quality gates (drops invalid captures)
+- Reproducibility manifest
 
 Usage:
     python -m s03_dataset.build_dataset --profile s01_profiles/obxf.yaml --m 10 --out data/
     # 2**10 = 1024 vectors * len(notes) captures
-
-This imports capture_v1_2 lazily so unit tests that don't need DawDreamer
-can still import the module.
 """
 from __future__ import annotations
 import argparse
-import hashlib
 import sys
 from pathlib import Path
 
@@ -44,7 +41,7 @@ def build_dataset(
     """Render 2**m * len(notes) captures into out_dir and write manifest.yaml."""
     import dawdreamer as daw                              # noqa: local import
     from s02_capture.capture_v1_2 import (                # noqa: local import
-        resolve_plugin_path, build_name_index, apply_params, reset, render_one,
+        resolve_plugin_path, build_name_index, capture_vector,
         SAMPLE_RATE, BUFFER_SIZE,
     )
 
@@ -72,35 +69,45 @@ def build_dataset(
     counts = Counts()
     rows = []
 
-    for i, u_row in enumerate(tqdm(vectors, desc="capturing")):
-        reset(synth, profile, name_idx)
-        params = apply_importance(u_row, modulated, profile, mode=importance_mode)
-        params_dict = dict(params)
-        apply_params(synth, params_dict, profile, name_idx)
+    played_notes_prev: list[int] = []
 
-        for note in notes:
-            audio = render_one(engine, synth, note, profile)
+    for u_row in tqdm(vectors, desc="capturing"):
+        # Apply importance weighting to the uniform Sobol row
+        params = apply_importance(u_row, modulated, profile, mode=importance_mode)
+        vec = np.array([v for _, v in params], dtype=np.float64)
+
+        results, _ = capture_vector(
+            engine, synth, vec, notes, profile, name_idx,
+            modulated, played_notes_prev=played_notes_prev,
+        )
+        played_notes_prev = [r["note"] for r in results]
+
+        for r in results:
             counts.rendered += 1
+            audio = r["audio"]
             stats = analyse(
                 audio, sample_rate=SAMPLE_RATE,
                 hold_sec=float(profile["probe"]["hold_sec"]),
                 release_sec=float(profile["probe"]["release_sec"]),
                 pre_roll_sec=float(profile["probe"].get("pre_roll_sec", 0.0)),
+                self_noise=r["self_noise"],
             )
-            if stats.silent:    counts.silent += 1
-            if stats.clipped:   counts.clipped += 1
-            if stats.stuck:     counts.stuck += 1
+            if stats.silent:     counts.silent += 1
+            if stats.clipped:    counts.clipped += 1
+            if stats.stuck:      counts.stuck += 1
             if stats.prev_bleed: counts.prev_bleed += 1
             if not stats.is_valid():
                 continue
             counts.valid += 1
 
-            h = hashlib.md5(u_row.tobytes() + bytes([note])).hexdigest()[:12]
-            wav_path = wav_dir / f"{h}_n{note}.wav"
+            wav_path = wav_dir / f"{r['hash']}_n{r['note']}.wav"
             sf.write(wav_path, audio, SAMPLE_RATE)
             rows.append({
-                "hash": h, "note": note, "wav": str(wav_path.relative_to(out_dir)),
-                **{f"p_{k}": v for k, v in params_dict.items()},
+                "hash": r["hash"],
+                "note": r["note"],
+                "wav": str(wav_path.relative_to(out_dir)),
+                "self_noise": r["self_noise"],
+                **{f"p_{k}": v for k, v in r["params_dict"].items()},
             })
 
     pd.DataFrame(rows).to_parquet(out_dir / "samples.parquet")
