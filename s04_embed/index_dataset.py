@@ -11,7 +11,8 @@ Usage:
     python -m s04_embed.index_dataset \
         --dataset s02_capture/data/ \
         --out s04_embed/data/ \
-        --pool mean
+        --pool mean \
+        --batch-size 32
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ import pandas as pd
 import soundfile as sf
 from tqdm import tqdm
 
+from defaults import SAMPLE_RATE
 from .embed import Embedder
 
 CHECKPOINT_EVERY = 500
@@ -81,10 +83,28 @@ def _log_latent_stats(arr: np.ndarray, done: np.ndarray, dim: int) -> None:
     print(f"  Global range:  [{valid.min():.3f}, {valid.max():.3f}]")
 
 
+def _embed_batch(
+    emb: Embedder,
+    indices: list[int],
+    audios: list[np.ndarray],
+    sr: int,
+    out_arr: np.ndarray,
+    done_mask: np.ndarray,
+    pool: str,
+) -> None:
+    """Run one batch through the encoder and scatter results into out_arr."""
+    results = emb.encodec_embed_batch(audios, sr=sr, pool=pool)
+    for k, idx in enumerate(indices):
+        out_arr[idx] = results[k]
+        done_mask[idx] = True
+
+
 def index_dataset(
     dataset_dir: Path | str,
     out_dir: Path | str,
     pool: str = "mean",
+    batch_size: int = 32,
+    device: str | None = None,
 ) -> Path:
     """Embed all captures and write encodec_embeddings.npy.
 
@@ -145,12 +165,16 @@ def index_dataset(
 
     # ── Embedding loop ───────────────────────────────────────────────────
     n_already = int(done_mask.sum())
-    n_remaining = len(df) - n_already
-    emb = Embedder()
+    emb = Embedder(device=device)
     skipped = 0
     newly_done = 0
+    next_ckpt = CHECKPOINT_EVERY
 
     pbar = tqdm(total=len(df), initial=n_already, desc="embedding")
+
+    batch_indices: list[int] = []
+    batch_audios: list[np.ndarray] = []
+    batch_sr: int = SAMPLE_RATE
 
     for i, row in enumerate(df.itertuples()):
         if done_mask[i]:
@@ -161,18 +185,42 @@ def index_dataset(
             wav_path = wav_root / wav_path
         if not wav_path.exists():
             skipped += 1
-            done_mask[i] = True  # mark as done (zero vector — WAV missing)
+            done_mask[i] = True
             pbar.update(1)
             continue
 
-        audio, sr = sf.read(wav_path, dtype="float32", always_2d=False)
-        out_arr[i] = emb.encodec_embed(audio, sr, pool=pool)
-        done_mask[i] = True
-        newly_done += 1
-        pbar.update(1)
+        audio, file_sr = sf.read(wav_path, dtype="float32", always_2d=False)
 
-        if newly_done % CHECKPOINT_EVERY == 0:
-            _flush(npy_path, done_path, out_arr, done_mask)
+        # Flush before appending if sr changed (all captures are 48 kHz; defensive)
+        if batch_indices and file_sr != batch_sr:
+            _embed_batch(emb, batch_indices, batch_audios, batch_sr, out_arr, done_mask, pool)
+            pbar.update(len(batch_indices))
+            newly_done += len(batch_indices)
+            batch_indices.clear()
+            batch_audios.clear()
+            if newly_done >= next_ckpt:
+                _flush(npy_path, done_path, out_arr, done_mask)
+                next_ckpt = newly_done + CHECKPOINT_EVERY
+
+        batch_sr = file_sr
+        batch_indices.append(i)
+        batch_audios.append(audio)
+
+        if len(batch_indices) >= batch_size:
+            _embed_batch(emb, batch_indices, batch_audios, batch_sr, out_arr, done_mask, pool)
+            pbar.update(len(batch_indices))
+            newly_done += len(batch_indices)
+            batch_indices.clear()
+            batch_audios.clear()
+            if newly_done >= next_ckpt:
+                _flush(npy_path, done_path, out_arr, done_mask)
+                next_ckpt = newly_done + CHECKPOINT_EVERY
+
+    # Flush remaining partial batch
+    if batch_indices:
+        _embed_batch(emb, batch_indices, batch_audios, batch_sr, out_arr, done_mask, pool)
+        pbar.update(len(batch_indices))
+        newly_done += len(batch_indices)
 
     pbar.close()
 
@@ -197,9 +245,14 @@ def main() -> int:
                     help="Output directory for encodec_embeddings.npy")
     ap.add_argument("--pool", choices=["mean", "meanstd"], default="mean",
                     help="Pooling mode: mean (128-d) or meanstd (256-d)")
+    ap.add_argument("--batch-size", type=int, default=32,
+                    help="Number of WAVs per GPU forward pass (default: 32)")
+    ap.add_argument("--device", default=None,
+                    help="Torch device override, e.g. cuda:0, cuda:1, cpu")
     args = ap.parse_args()
 
-    index_dataset(args.dataset, args.out, pool=args.pool)
+    index_dataset(args.dataset, args.out, pool=args.pool,
+                  batch_size=args.batch_size, device=args.device)
     return 0
 
 

@@ -6,12 +6,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **MimicSynth** (`MimicSynth/`) is an ML audio dataset pipeline that captures synthesizer parameter-timbre mappings. It renders parameter vectors through a VST plugin (OB-Xf) via DawDreamer and produces labeled WAV datasets for training inverse models. The pipeline is stage-based, with directories prefixed `s01_` through `s04_`.
 
+## Environments
+
+Two Python environments are in use — they are not interchangeable:
+
+| Env | Activation | Used for |
+|-----|-----------|----------|
+| `.venv` (Python 3.14) | `source .venv/bin/activate` | CPU stages: tests, capture, dataset build/verify |
+| `mimic-synth` conda (Python 3.11) | `conda activate mimic-synth` | GPU stages: s04_embed (torch 2.11+cu130) |
+
+`torch` is **only** in the conda env. Running embed commands with `.venv/bin/python` will fail with `ModuleNotFoundError`.
+
 ## Common Commands
 
-All commands run from `MimicSynth/` with the local venv:
+CPU stages — run from `MimicSynth/` with the local venv:
 
 ```bash
-# Activate venv
 source .venv/bin/activate
 
 # Run all tests
@@ -20,10 +30,8 @@ source .venv/bin/activate
 # Skip integration tests (no DawDreamer/OB-Xf needed)
 .venv/bin/pytest -m "not integration"
 
-# Run a single test file
+# Run a single test file / test
 .venv/bin/pytest tests/test_sampling.py
-
-# Run a single test
 .venv/bin/pytest tests/test_sampling.py::test_cold_start_vectors_shape
 
 # Capture audio (from s02_capture/)
@@ -37,12 +45,22 @@ cd s02_capture && ../.venv/bin/python capture_v1_2.py
 
 # List VST parameters
 .venv/bin/python enumerate_params.py
+```
+
+GPU stages — activate the conda env first:
+
+```bash
+conda activate mimic-synth
 
 # Embed dataset (pre-compute EnCodec embeddings, supports resume)
-.venv/bin/python -m s04_embed.index_dataset --dataset s02_capture/data/ --out s04_embed/data/ --pool mean
+# --batch-size controls clips per GPU forward pass; 32 is conservative, try 64-128 on 4090
+python -m s04_embed.index_dataset --dataset s02_capture/data/ --out s04_embed/data/ --pool mean --batch-size 32
+
+# Force a specific GPU (e.g. use 3070 instead of 4090)
+python -m s04_embed.index_dataset --dataset s02_capture/data/ --out s04_embed/data/ --pool mean --device cuda:1
 
 # Verify embeddings
-.venv/bin/python -m s04_embed.verify_embeddings --embeddings s04_embed/data/encodec_embeddings.npy --dataset s02_capture/data/
+python -m s04_embed.verify_embeddings --embeddings s04_embed/data/encodec_embeddings.npy --dataset s02_capture/data/
 ```
 
 ## Architecture
@@ -62,6 +80,14 @@ cd s02_capture && ../.venv/bin/python capture_v1_2.py
   - `embed.py` — `Embedder` class: `encodec_embed()` for pooled vectors (128-d mean / 256-d meanstd), `encodec_sequence()` for frame-wise [128, T], `mrstft_feats()` for auxiliary multi-res STFT
   - `index_dataset.py` — CLI to pre-compute `encodec_embeddings.npy` aligned 1-to-1 with `samples.parquet`. Supports checkpoint/resume/overwrite (same pattern as capture_v1_2.py)
   - `verify_embeddings.py` — Post-hoc embedding auditor: shape alignment, completeness, NaN/Inf, latent stats, nearest/farthest neighbor spot-check
+
+### GPU / hardware
+
+- **GPUs**: RTX 4090 24 GB (cuda:0, primary), RTX 3070 8 GB (cuda:1). `embed.py` selects `cuda` (= cuda:0) by default.
+- **torch.compile**: `Embedder.__init__` compiles `self.enc.encoder` with `mode="reduce-overhead"` on CUDA. First forward pass incurs a ~30s JIT warmup; all subsequent calls in the same process are faster. Does not compile on CPU (`Embedder(device="cpu")` is eager, used by tests).
+- **fp16 autocast**: encoder forward passes run in `torch.float16` on CUDA via `torch.amp.autocast`. EnCodec pre-quantiser latents are safe in fp16; outputs are cast back to float32 before returning numpy arrays.
+- **Batch size**: `index_dataset.py` accumulates WAVs and embeds in batches (`--batch-size`, default 32). EnCodec 48 kHz is ~15M params (~60 MB). The 4090 has headroom for batches of 64–128. Increase if GPU utilization is low.
+- **Device override**: pass `--device cuda:1` to `index_dataset.py` to route to the 3070 (e.g., if the 4090 is occupied).
 
 ### Key patterns
 

@@ -39,11 +39,17 @@ class Embedder:
     inference use identical embeddings.
     """
 
-    def __init__(self, device: str | None = None):
+    def __init__(self, device: str | None = None, compile: bool = True):
         self.device = device or DEVICE
         self.enc = EncodecModel.encodec_model_48khz().to(self.device)
         self.enc.set_target_bandwidth(6.0)
         self.enc.eval()
+        self._channels = self.enc.channels  # cache before possible compile replacement
+        self._amp = self.device.startswith("cuda")
+        if compile and self._amp:
+            # Compile the encoder submodule only — that's what we call directly.
+            # First forward pass triggers ~30s JIT warmup; subsequent calls are faster.
+            self.enc.encoder = torch.compile(self.enc.encoder, mode="reduce-overhead")
 
     @torch.no_grad()
     def encodec_embed(
@@ -63,9 +69,10 @@ class Embedder:
         x = torch.from_numpy(audio).float()
         if x.ndim == 1:
             x = x.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
-        x = convert_audio(x, sr, ENCODEC_SR, self.enc.channels).to(self.device)
-        emb = self.enc.encoder(x)  # [B, 128, T]
-        emb = emb.squeeze(0).cpu().numpy()  # [128, T]
+        x = convert_audio(x, sr, ENCODEC_SR, self._channels).to(self.device)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=self._amp):
+            emb = self.enc.encoder(x)  # [B, 128, T]
+        emb = emb.float().squeeze(0).cpu().numpy()  # [128, T]
 
         if pool == "mean":
             return emb.mean(axis=1).astype(np.float32)  # [128]
@@ -111,12 +118,13 @@ class Embedder:
             padded = np.zeros(max_len, dtype=np.float32)
             padded[:len(a)] = a
             x_i = torch.from_numpy(padded).float().unsqueeze(0)  # (1, T)
-            x_i = convert_audio(x_i, sr, ENCODEC_SR, self.enc.channels)  # (2, T')
+            x_i = convert_audio(x_i, sr, ENCODEC_SR, self._channels)  # (2, T')
             converted.append(x_i)
         x = torch.stack(converted, dim=0).to(self.device)  # (B, 2, T')
 
-        emb = self.enc.encoder(x)  # [B, 128, T_enc]
-        emb = emb.cpu().numpy()    # [B, 128, T_enc]
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=self._amp):
+            emb = self.enc.encoder(x)  # [B, 128, T_enc]
+        emb = emb.float().cpu().numpy()    # [B, 128, T_enc]
 
         # Compute per-sample frame counts to mask padding
         enc_stride = max_len / emb.shape[2] if emb.shape[2] > 0 else 1
