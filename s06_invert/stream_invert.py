@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from s05_surrogate.model import Surrogate
 from s06_invert.invert import _load_surrogate, _estimate_best_note
+import defaults as _defs
 
 def stream_invert(
     target_wav: Path,
@@ -81,8 +82,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
     ap.add_argument("--surrogate", required=True)
-    ap.add_argument("--profile", required=True)
-    ap.add_argument("--out", default="patches/")
+    ap.add_argument("--profile", default=str(_defs.PROFILE_PATH))
+    ap.add_argument("--out", default=str(_defs.S06_PATCHES_DIR))
     ap.add_argument("--win-sec", type=float, default=0.05) # 20fps tracking
     ap.add_argument("--hop-sec", type=float, default=0.02)
     args = ap.parse_args()

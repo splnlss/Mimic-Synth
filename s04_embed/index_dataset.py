@@ -25,6 +25,7 @@ import pandas as pd
 import soundfile as sf
 from tqdm import tqdm
 
+import defaults as _defs
 from defaults import SAMPLE_RATE
 from .embed import Embedder
 
@@ -239,9 +240,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Pre-compute EnCodec embeddings for a capture dataset."
     )
-    ap.add_argument("--dataset", required=True,
+    ap.add_argument("--dataset", default=str(_defs.S02_DIR),
                     help="Path to dataset dir (with samples.parquet + wav/)")
-    ap.add_argument("--out", required=True,
+    ap.add_argument("--out", default=str(_defs.S04_DIR),
                     help="Output directory for encodec_embeddings.npy")
     ap.add_argument("--pool", choices=["mean", "meanstd"], default="mean",
                     help="Pooling mode: mean (128-d) or meanstd (256-d)")

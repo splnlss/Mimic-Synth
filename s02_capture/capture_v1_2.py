@@ -20,6 +20,7 @@ V1.2 changes vs V1.1:
 
 M=10 by default (2^10 = 1,024 vectors). Use M=14 for production.
 """
+import sys
 from pathlib import Path
 import hashlib
 import math
@@ -31,13 +32,15 @@ import soundfile as sf
 from scipy.stats.qmc import Sobol
 from tqdm import tqdm
 
-SAMPLE_RATE = 48000
-BUFFER_SIZE = 512
+# Allow running as `python s02_capture/capture_v1_2.py` from the repo root
+# or as `python capture_v1_2.py` from inside s02_capture/
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from defaults import PROFILE_PATH, S02_DIR, S02_WAV_DIR, S02_PARQUET, SAMPLE_RATE, BUFFER_SIZE
+
 M = 14                       # Sobol exponent: 2^M vectors (14 → 16,384 vectors)
-PROFILE_PATH = Path("s01_profiles/obxf.yaml")
-OUT_DIR = Path("s02_capture/data")
-WAV_DIR = OUT_DIR / "wav"
-PARQUET_PATH = OUT_DIR / "samples.parquet"
+OUT_DIR      = S02_DIR
+WAV_DIR      = S02_WAV_DIR
+PARQUET_PATH = S02_PARQUET
 CHECKPOINT_EVERY = 50        # flush parquet every N vectors
 
 # Settle pass — renders silent chunks to drain release tails between captures.
@@ -218,10 +221,10 @@ def capture_vector(engine, synth, vec, notes, profile, name_idx,
 
 
 def _prompt_resume_or_overwrite(n_rows: int) -> str:
-    # Auto-overwrite for non-interactive runs
+    # Auto-resume for non-interactive runs (piped stdin, nohup, background jobs)
     import sys
     if not sys.stdin.isatty():
-        return "overwrite"
+        return "resume"
     while True:
         ans = input(
             f"\nExisting dataset found at {PARQUET_PATH} with {n_rows} rows.\n"

@@ -32,6 +32,7 @@ import torch
 import yaml
 
 from s05_surrogate.model import Surrogate
+import defaults as _defs
 from s06_invert.grad_search import grad_invert
 from s06_invert.cmaes_search import cmaes_invert
 
@@ -176,10 +177,10 @@ def main() -> int:
         description="Invert a target audio clip to synth parameters."
     )
     ap.add_argument("--target", required=True, help="Path to target WAV/FLAC")
-    ap.add_argument("--surrogate", required=True,
-                    help="Path to surrogate state_dict.pt")
-    ap.add_argument("--profile", required=True, help="Path to synth profile YAML")
-    ap.add_argument("--out", required=True, help="Output directory for patches/")
+    ap.add_argument("--surrogate", default=None,
+                    help="Path to surrogate state_dict.pt (default: latest run in S05_RUNS_DIR)")
+    ap.add_argument("--profile", default=str(_defs.PROFILE_PATH), help="Path to synth profile YAML")
+    ap.add_argument("--out", default=str(_defs.S06_PATCHES_DIR), help="Output directory for patches/")
     ap.add_argument("--note", type=int, default=None,
                     help="MIDI note (default: brute-force over profile notes)")
     ap.add_argument("--n-starts", type=int, default=32,
@@ -191,6 +192,12 @@ def main() -> int:
     ap.add_argument("--device", default=None,
                     help="Torch device (default: cuda if available)")
     args = ap.parse_args()
+
+    if args.surrogate is None:
+        runs = sorted(_defs.S05_RUNS_DIR.glob("run_*")) if _defs.S05_RUNS_DIR.exists() else []
+        if not runs:
+            ap.error("No surrogate runs found in S05_RUNS_DIR; pass --surrogate explicitly.")
+        args.surrogate = str(runs[-1] / "state_dict.pt")
 
     invert(
         target_wav=Path(args.target),

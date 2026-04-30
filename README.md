@@ -7,13 +7,15 @@ A pipeline for building audio datasets from synthesizers and training models tha
 | Stage | Folder | Status | Purpose |
 |-------|--------|--------|---------|
 | S01 | `s01_profiles/` | ✅ Complete | Synth profile — parameter definitions, importance weights, probe config |
-| S02 | `s02_capture/` | ✅ Complete | Capture rig — renders (param vector, note) to WAV via DawDreamer |
-| S03 | `s03_dataset/` | ✅ Complete | Dataset builder — Sobol sampling, quality gates, manifest, verifier |
-| S04 | `s04_embed/` | ✅ Complete | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
+| S02 | `s02_capture/` | 🔄 Active | Capture rig — renders (param vector, note) to WAV via DawDreamer |
+| S03 | `s03_dataset/` | ⏳ Pending | Dataset builder — Sobol sampling, quality gates, manifest, verifier |
+| S04 | `s04_embed/` | ⏳ Pending | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
 | S05 | `s05_surrogate/` | ✅ Complete | Forward model — MLP mapping (params, note) → EnCodec latent |
 | S06 | `s06_invert/` | ⚠️ WIP | Patch search — grad descent + CMA-ES inversion of target audio |
 | S07 | `s07_refine/` | 🔲 Planned | Refine — close gap between surrogate score and real-synth output |
 | S08 | `s08_package/` | 🔲 Planned | Package — ONNX export + nn~ / Max/Pd integration |
+
+S03/S04/S05 have dev-scale builds (M=10, 5,120 samples). Production rebuilds are pending S02 completion (~11,373/16,384 vectors done, 69%).
 
 ---
 
@@ -30,6 +32,33 @@ A pipeline for building audio datasets from synthesizers and training models tha
 | `mimic-synth` conda (Python 3.11) | `conda env create -f environment.yml` | All pipeline stages (DawDreamer + torch/CUDA) |
 
 `torch` and `dawdreamer` are only in the conda env. Running pipeline commands with `.venv/bin/python` will fail.
+
+---
+
+## Data storage
+
+All pipeline outputs (WAVs, parquet, embeddings, model checkpoints, patches) live on an external drive — **not** in this repo. Source code stays here.
+
+Data root is configured in `defaults.py`:
+
+```python
+DATA_ROOT    = Path("/mnt/d/Mimic-Synth-Data")   # D:\Mimic-Synth-Data on Windows
+PROJECT_NAME = "OB-X_Prototype"
+```
+
+Directory layout under `DATA_ROOT / PROJECT_NAME`:
+
+```
+OB-X_Prototype/
+  s02_capture/          raw WAVs + samples.parquet
+  s03_dataset/          quality-gated dataset + manifest.yaml
+  s04_embed/            encodec_embeddings.npy
+  s05_surrogate/runs/   model checkpoints (state_dict.pt, surrogate.onnx)
+  s06_invert/patches/   inversion results (best_patch.yaml, rendered.wav, …)
+  targets/              target audio files used as inversion inputs
+```
+
+Change `DATA_ROOT` and `PROJECT_NAME` in `defaults.py` to relocate or switch between projects.
 
 ---
 
@@ -51,13 +80,13 @@ Lists all parameters exposed by the OB-Xf VST.
 
 ### 2. Capture raw audio (S02)
 
-Renders 2^M Sobol-sampled parameter vectors × N notes into `s02_capture/data/`. Production uses M=14 (16,384 vectors × 15 notes = 245,760 captures).
+Renders 2^M Sobol-sampled parameter vectors × 16 notes into the data directory. Production uses M=14 (16,384 vectors × 16 notes = 262,144 captures). All output paths come from `defaults.py` — no flags needed.
 
 ```bash
-cd s02_capture && python capture_v1_2.py
+python s02_capture/capture_v1_2.py
 ```
 
-Checkpoints every 50 vectors — if interrupted, re-run and choose **[c]ontinue**.
+Checkpoints every 50 vectors. If interrupted, re-run — it resumes automatically (interactive: choose **[c]ontinue**; non-interactive/background: resumes without prompting).
 
 Key features (v1.2):
 - **Settle-before-patch-change**: drains the old patch's release tail before loading new parameters
@@ -68,91 +97,75 @@ Key features (v1.2):
 
 ### 3. Build the dataset (S03)
 
-Post-hoc mode reads an existing capture, applies quality gates, and writes a manifest. No re-rendering needed.
+Post-hoc mode reads an existing capture, applies quality gates, and writes a manifest. No re-rendering needed. All paths default via `defaults.py`.
 
 ```bash
 python -m s03_dataset.build_dataset \
-    --profile s01_profiles/obxf.yaml \
-    --from-capture s02_capture/data/ \
-    --out s03_dataset/data/
+    --from-capture /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s02_capture
 ```
 
 Or live capture from scratch (slower, requires DawDreamer):
 
 ```bash
-python -m s03_dataset.build_dataset \
-    --profile s01_profiles/obxf.yaml --m 14 --out s03_dataset/data/
+python -m s03_dataset.build_dataset --m 14
 ```
 
 Verify the result:
 
 ```bash
 python -m s03_dataset.verify_dataset \
-    --dataset s03_dataset/data/ --profile s01_profiles/obxf.yaml
+    --dataset /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s03_dataset
 ```
 
 ### 4. Embed the dataset (S04)
 
-Pre-computes 128-d EnCodec embeddings aligned 1-to-1 with `samples.parquet`.
+Pre-computes 128-d EnCodec embeddings aligned 1-to-1 with `samples.parquet`. All paths default via `defaults.py`.
 
 ```bash
-python -m s04_embed.index_dataset \
-    --dataset s03_dataset/data/ --out s04_embed/data/ \
-    --pool mean --batch-size 64
+python -m s04_embed.index_dataset --pool mean --batch-size 64
 ```
 
 Checkpoints every 500 rows. Verify with:
 
 ```bash
-python -m s04_embed.verify_embeddings \
-    --embeddings s04_embed/data/encodec_embeddings.npy \
-    --dataset s03_dataset/data/
+python -m s04_embed.verify_embeddings
 ```
 
 ### 5. Train the surrogate (S05)
 
-Trains a 4-layer MLP to approximate `f(params, note) → EnCodec latent`.
+Trains a 4-layer MLP to approximate `f(params, note) → EnCodec latent`. All paths default via `defaults.py`.
 
 ```bash
-python -m s05_surrogate.train \
-    --dataset s03_dataset/data/samples.parquet \
-    --embeddings s04_embed/data/encodec_embeddings.npy \
-    --out s05_surrogate/runs/
+python -m s05_surrogate.train
 ```
 
 Verify with a full round-trip check on the held-out test split (spec criterion: cos-sim ≥ 0.9):
 
 ```bash
-python -m s05_surrogate.verify_surrogate \
-    --checkpoint s05_surrogate/runs/<run_id>/state_dict.pt \
-    --dataset s03_dataset/data/samples.parquet \
-    --embeddings s04_embed/data/encodec_embeddings.npy \
-    --profile s01_profiles/obxf.yaml
+python -m s05_surrogate.verify_surrogate
 ```
 
-Current best checkpoint: `runs/run_20260429_145056/` — val loss 0.0061, test-split cos-sim 0.9988.
+Auto-selects the latest run in `S05_RUNS_DIR`. Current best: `run_20260429_145056` — val loss 0.0061, test-split cos-sim 0.9988 (dev-scale data; production retrain pending).
 
 ### 6. Invert a target sound (S06) ⚠️ WIP
 
 Given a target WAV, finds the OB-Xf parameter vector whose surrogate-predicted embedding is closest to the target. Uses pitch detection to select the best MIDI note, then runs multi-start gradient descent followed by CMA-ES refinement.
 
+Profile, output directory, and surrogate checkpoint all default via `defaults.py`:
+
 ```bash
-python -m s06_invert.invert \
-    --target path/to/target.wav \
-    --surrogate s05_surrogate/runs/run_20260429_145056/state_dict.pt \
-    --profile s01_profiles/obxf.yaml \
-    --out patches/
+python -m s06_invert.invert --target path/to/target.wav
 ```
 
-Output: `patches/<target_stem>/best_patch.yaml`, `candidates.parquet`, `target_embedding.npy`.
+Output: `s06_invert/patches/<target_stem>/best_patch.yaml`, `candidates.parquet`, `target_embedding.npy`.
 
 Render the recovered patch through OB-Xf:
 
 ```bash
 python s06_invert/render_stream.py \
-    --patch patches/<target_stem>/best_patch.yaml \
+    --patch /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s06_invert/patches/<stem>/best_patch.yaml \
     --profile s01_profiles/obxf.yaml \
-    --out patches/<target_stem>/rendered.wav
+    --out /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s06_invert/patches/<stem>/rendered.wav
 ```
 
 ---
@@ -176,7 +189,7 @@ conda run -n mimic-synth python -m pytest tests/test_s05_surrogate.py tests/test
 ## Project structure
 
 ```
-defaults.py                  # Shared constants (SAMPLE_RATE, BUFFER_SIZE)
+defaults.py                  # Data root, project name, all stage paths
 enumerate_params.py          # Utility: list all VST parameters
 build_instructions/          # Per-stage design docs (01–08)
 
@@ -184,8 +197,7 @@ s01_profiles/
   obxf.yaml                  # OB-Xf parameter profile
 
 s02_capture/
-  capture_v1_2.py            # Current capture rig
-  data/                      # samples.parquet + wav/ (gitignored)
+  capture_v1_2.py            # Current capture rig (M=14 production)
 
 s03_dataset/
   build_dataset.py           # Dataset builder CLI (--from-capture or --m)
@@ -194,19 +206,16 @@ s03_dataset/
   manifest.py                # Reproducibility manifest
   sequences.py               # Temporal sequence dataset builder
   verify_dataset.py          # Post-hoc auditor
-  data/                      # samples.parquet + wav/ (gitignored)
 
 s04_embed/
   embed.py                   # Embedder class (EnCodec 48kHz)
   index_dataset.py           # Pre-compute embeddings CLI
   verify_embeddings.py       # Post-hoc embedding auditor
-  data/                      # encodec_embeddings.npy (gitignored)
 
 s05_surrogate/
   model.py                   # Surrogate MLP + SurrogateDataset
   train.py                   # Training loop CLI
   verify_surrogate.py        # Round-trip + sweep + gradient checks
-  runs/                      # Checkpoints (gitignored)
 
 s06_invert/
   grad_search.py             # Multi-start gradient descent
@@ -229,6 +238,9 @@ tests/
   test_s05_surrogate.py
   test_invert.py
   test_integration.py        # Requires DawDreamer + OB-Xf
+
+# Data lives on external drive — not in repo
+# /mnt/d/Mimic-Synth-Data/OB-X_Prototype/   (see defaults.py)
 ```
 
 ---
@@ -245,7 +257,7 @@ parameters:
     importance: 1.0     # 0 = fixed at reset, 1 = full range sampled
 
 probe:
-  notes: [36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 72, 84]
+  notes: [34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 72, 84]
   velocity: 100
   hold_sec: 1.5
   release_sec: 4.5
@@ -264,7 +276,7 @@ The surrogate learns `f(params, note) → EnCodec latent` from captured data. In
 target.wav → EnCodec → target_embedding [128-d]
                               ↓
          search: find params p s.t. surrogate(p, note) ≈ target_embedding
-              ├── multi-start gradient descent (Adam, 16 starts × 300 steps)
+              ├── multi-start gradient descent (Adam, 32 starts × 500 steps)
               └── CMA-ES refinement (seeded from best grad result)
                               ↓
                     best_patch.yaml  →  DawDreamer  →  rendered.wav

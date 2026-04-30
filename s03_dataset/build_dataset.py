@@ -32,6 +32,8 @@ from .sampling import cold_start_vectors, apply_importance
 from .quality import analyse
 from .manifest import Manifest, Phase, Counts, new_manifest, write_manifest, MANIFEST_FILENAME
 
+import defaults as _defs
+
 
 def _list_modulated(profile: dict) -> list[str]:
     return [n for n, s in profile["parameters"].items() if s.get("importance", 0) > 0]
@@ -221,12 +223,13 @@ def build_from_capture(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--profile", default=str(_defs.PROFILE_PATH))
+    ap.add_argument("--out", default=str(_defs.S03_DIR))
 
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--m", type=int, help="Live capture: Sobol exponent — generates 2**m vectors")
-    mode.add_argument("--from-capture", help="Post-hoc: path to existing capture directory")
+    mode.add_argument("--from-capture", default=None,
+                      help=f"Post-hoc: path to existing capture dir (default: {_defs.S02_DIR})")
 
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--importance-mode", choices=["filter", "scale"], default="filter")

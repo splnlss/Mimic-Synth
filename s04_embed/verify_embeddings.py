@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import defaults as _defs
 
 
 @dataclass
@@ -202,9 +203,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Verify EnCodec embeddings against dataset."
     )
-    ap.add_argument("--embeddings", required=True,
+    ap.add_argument("--embeddings", default=str(_defs.S04_EMBEDDINGS),
                     help="Path to encodec_embeddings.npy")
-    ap.add_argument("--dataset", required=True,
+    ap.add_argument("--dataset", default=str(_defs.S02_DIR),
                     help="Path to dataset dir (with samples.parquet)")
     ap.add_argument("--spot-check", action="store_true",
                     help="Run nearest/farthest neighbor spot-check")

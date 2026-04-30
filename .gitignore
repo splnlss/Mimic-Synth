@@ -1,24 +1,8 @@
-# Dataset output — large binary/audio files, not versioned
-s02_capture/data/
-s03_dataset/data/
-s04_embed/data/
-
-# Surrogate checkpoints — large binaries, not versioned
-s05_surrogate/runs/
-s05_surrogate/train.log
-
-# Inversion outputs
-patches/
-
-# Test reports (generated artefacts)
-tests/reports/
-
-# Python
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-.Python
 *.egg
 *.egg-info/
 dist/
@@ -26,12 +10,47 @@ build/
 .eggs/
 pip-wheel-metadata/
 
-# Virtual environment
+# ── Virtual environments ───────────────────────────────────────────────────────
 .venv/
 venv/
 env/
 
-# Secrets and credentials (NEVER commit)
+# ── Testing & coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+tests/reports/
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS — macOS ────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+
+# ── OS — Windows ──────────────────────────────────────────────────────────────
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── OS — Linux ────────────────────────────────────────────────────────────────
+.fuse_hidden*
+.Trash-*
+.nfs*
+
+# ── Secrets (never commit) ────────────────────────────────────────────────────
 .env
 .env.local
 .env.*.local
@@ -40,32 +59,20 @@ env/
 *.pem
 secrets/
 credentials/
-config.yaml
 *.apikey
 
-# Pytest / coverage
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
 
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Jupyter
+# ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb
 
-# Audio / binary artefacts (if generated elsewhere)
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/
+CLAUDE.md
+
+# ── Large binary / data files (safety net — all project data lives on D:) ────
 *.wav
 *.flac
 *.aif

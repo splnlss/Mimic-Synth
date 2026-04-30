@@ -31,6 +31,7 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import random_split
 from tqdm import tqdm
+import defaults as _defs
 
 from s05_surrogate.model import Surrogate
 from s06_invert.grad_search import grad_invert
@@ -158,10 +159,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Validate surrogate inversion on held-out test split."
     )
-    ap.add_argument("--surrogate", required=True, help="Path to state_dict.pt")
-    ap.add_argument("--dataset", required=True, help="Path to samples.parquet")
-    ap.add_argument("--embeddings", required=True, help="Path to encodec_embeddings.npy")
-    ap.add_argument("--profile", required=True, help="Path to synth profile YAML")
+    ap.add_argument("--surrogate", default=None, help="Path to state_dict.pt (default: latest run)")
+    ap.add_argument("--dataset", default=str(_defs.S03_PARQUET), help="Path to samples.parquet")
+    ap.add_argument("--embeddings", default=str(_defs.S04_EMBEDDINGS), help="Path to encodec_embeddings.npy")
+    ap.add_argument("--profile", default=str(_defs.PROFILE_PATH), help="Path to synth profile YAML")
     ap.add_argument("--n-starts", type=int, default=16)
     ap.add_argument("--grad-steps", type=int, default=300)
     ap.add_argument("--cmaes-maxiter", type=int, default=200)
@@ -169,6 +170,12 @@ def main() -> int:
                     help="Run stability check on first test sample")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
+
+    if args.surrogate is None:
+        runs = sorted(_defs.S05_RUNS_DIR.glob("run_*")) if _defs.S05_RUNS_DIR.exists() else []
+        if not runs:
+            ap.error("No surrogate runs found in S05_RUNS_DIR; pass --surrogate explicitly.")
+        args.surrogate = str(runs[-1] / "state_dict.pt")
 
     result = validate(
         surrogate_checkpoint=Path(args.surrogate),

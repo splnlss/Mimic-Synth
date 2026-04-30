@@ -9,15 +9,16 @@ import argparse
 import datetime
 from torch.utils.data import DataLoader, random_split
 from .model import Surrogate, SurrogateDataset
+import defaults as _defs
 
 def cosine_distance(x, y):
     return 1 - F.cosine_similarity(x, y, dim=-1)
 
 def train():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, required=True, help="Path to samples.parquet")
-    parser.add_argument("--embeddings", type=str, required=True, help="Path to embeddings.npy")
-    parser.add_argument("--out", type=str, required=True, help="Output directory for runs")
+    parser.add_argument("--dataset", type=str, default=str(_defs.S03_PARQUET), help="Path to samples.parquet")
+    parser.add_argument("--embeddings", type=str, default=str(_defs.S04_EMBEDDINGS), help="Path to embeddings.npy")
+    parser.add_argument("--out", type=str, default=str(_defs.S05_RUNS_DIR), help="Output directory for runs")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)

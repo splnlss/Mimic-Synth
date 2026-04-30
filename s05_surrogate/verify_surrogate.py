@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import defaults as _defs
 import torch.nn.functional as F
 import yaml
 from torch.utils.data import random_split
@@ -220,17 +221,23 @@ def verify(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Verify a trained surrogate.")
-    ap.add_argument("--checkpoint", required=True, help="Path to state_dict.pt")
-    ap.add_argument("--dataset", default=None,
+    ap.add_argument("--checkpoint", default=None, help="Path to state_dict.pt (default: latest run)")
+    ap.add_argument("--dataset", default=str(_defs.S03_PARQUET),
                     help="Path to samples.parquet (enables round-trip check)")
-    ap.add_argument("--embeddings", default=None,
+    ap.add_argument("--embeddings", default=str(_defs.S04_EMBEDDINGS),
                     help="Path to encodec_embeddings.npy (enables round-trip check)")
-    ap.add_argument("--profile", default=None,
+    ap.add_argument("--profile", default=str(_defs.PROFILE_PATH),
                     help="Synth profile YAML (enables reset-value sweep baseline)")
     ap.add_argument("--input-dim", type=int, default=None,
                     help="Override input_dim if manifest.json is missing")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
+
+    if args.checkpoint is None:
+        runs = sorted(_defs.S05_RUNS_DIR.glob("run_*")) if _defs.S05_RUNS_DIR.exists() else []
+        if not runs:
+            ap.error("No surrogate runs found in S05_RUNS_DIR; pass --checkpoint explicitly.")
+        args.checkpoint = str(runs[-1] / "state_dict.pt")
 
     result = verify(
         checkpoint_path=Path(args.checkpoint),
