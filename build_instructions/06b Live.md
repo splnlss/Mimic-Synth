@@ -44,7 +44,7 @@ loudness follower              inverse model g(emb_window → params)
 
 Three "control streams" merge at MIDI out:
 
-1. **Pitch & note-on/off** — from the pitch tracker (deterministic DSP).
+1. **Pitch, pitchbend & note-on/off** — from the pitch tracker (deterministic DSP).
 2. **Loudness / velocity / CC7** — from an RMS or BS.1770 follower (deterministic DSP).
 3. **Timbral CCs** — from the neural inverse model (this is the learned part).
 

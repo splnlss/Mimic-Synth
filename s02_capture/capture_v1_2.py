@@ -29,14 +29,13 @@ import pandas as pd
 import yaml
 import soundfile as sf
 from scipy.stats.qmc import Sobol
-import dawdreamer as daw
 from tqdm import tqdm
 
 SAMPLE_RATE = 48000
 BUFFER_SIZE = 512
 M = 14                       # Sobol exponent: 2^M vectors (14 → 16,384 vectors)
-PROFILE_PATH = "../s01_profiles/obxf.yaml"
-OUT_DIR = Path("data")
+PROFILE_PATH = Path("s01_profiles/obxf.yaml")
+OUT_DIR = Path("s02_capture/data")
 WAV_DIR = OUT_DIR / "wav"
 PARQUET_PATH = OUT_DIR / "samples.parquet"
 CHECKPOINT_EVERY = 50        # flush parquet every N vectors
@@ -219,6 +218,10 @@ def capture_vector(engine, synth, vec, notes, profile, name_idx,
 
 
 def _prompt_resume_or_overwrite(n_rows: int) -> str:
+    # Auto-overwrite for non-interactive runs
+    import sys
+    if not sys.stdin.isatty():
+        return "overwrite"
     while True:
         ans = input(
             f"\nExisting dataset found at {PARQUET_PATH} with {n_rows} rows.\n"
@@ -255,6 +258,7 @@ def main():
     notes = profile["probe"]["notes"]
 
     plugin_path = resolve_plugin_path(profile)
+    import dawdreamer as daw  # noqa: PLC0415 — lazy import; pure helpers must not require DawDreamer
     engine = daw.RenderEngine(SAMPLE_RATE, BUFFER_SIZE)
     synth = engine.make_plugin_processor("obxf", plugin_path)
     name_idx = build_name_index(synth)

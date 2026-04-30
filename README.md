@@ -1,180 +1,174 @@
 # MimicSynth
 
-A pipeline for building audio datasets from synthesizers, designed to train models that learn the parameter-to-timbre mapping of a synth. Currently targets the [OB-Xf](https://github.com/surge-synthesizer/OB-Xf) (free, open-source OB-Xa emulation) via DawDreamer, but the architecture is designed to extend to ASIO audio interfaces and hardware/analog synths with MIDI.
+A pipeline for building audio datasets from synthesizers and training models that learn the parameter-to-timbre mapping of a synth. Currently targets the [OB-Xf](https://github.com/surge-synthesizer/OB-Xf) (free, open-source OB-Xa emulation) via DawDreamer, with architecture designed to extend to hardware/analog synths via MIDI + audio interface.
 
-The pipeline has four stages (so far):
+## Pipeline stages
 
-| Stage | Folder | Purpose |
-|---|---|---|
-| S01 | `s01_profiles/` | Synth profile -- parameter definitions, importance weights, probe config |
-| S02 | `s02_capture/` | Capture rig -- renders (param vector, note) to WAV via DawDreamer |
-| S03 | `s03_dataset/` | Dataset builder -- Sobol sampling, quality gates, manifest, verifier |
-| S04 | `s04_embed/` | Audio embedding -- EnCodec 48 kHz pre-quantiser latents (128-d) |
+| Stage | Folder | Status | Purpose |
+|-------|--------|--------|---------|
+| S01 | `s01_profiles/` | ✅ Complete | Synth profile — parameter definitions, importance weights, probe config |
+| S02 | `s02_capture/` | ✅ Complete | Capture rig — renders (param vector, note) to WAV via DawDreamer |
+| S03 | `s03_dataset/` | ✅ Complete | Dataset builder — Sobol sampling, quality gates, manifest, verifier |
+| S04 | `s04_embed/` | ✅ Complete | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
+| S05 | `s05_surrogate/` | ✅ Complete | Forward model — MLP mapping (params, note) → EnCodec latent |
+| S06 | `s06_invert/` | ⚠️ WIP | Patch search — grad descent + CMA-ES inversion of target audio |
+| S07 | `s07_refine/` | 🔲 Planned | Refine — close gap between surrogate score and real-synth output |
+| S08 | `s08_package/` | 🔲 Planned | Package — ONNX export + nn~ / Max/Pd integration |
 
 ---
 
 ## Requirements
 
-- Python 3.10+
 - [OB-Xf VST3](https://github.com/surge-synthesizer/OB-Xf/releases) installed at the system default path
-- macOS, Windows, or Linux
+- Two Python environments (see below)
 
-Install Python dependencies:
+### Environments
 
-```bash
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
+| Env | Setup | Used for |
+|-----|-------|---------|
+| `.venv` (Python 3.14) | `python -m venv .venv && pip install -r requirements.txt` | Unit tests, CPU-only utilities |
+| `mimic-synth` conda (Python 3.11) | `conda env create -f environment.yml` | All pipeline stages (DawDreamer + torch/CUDA) |
+
+`torch` and `dawdreamer` are only in the conda env. Running pipeline commands with `.venv/bin/python` will fail.
 
 ---
 
 ## Quickstart
 
-### 1. Verify the plugin is found
+All pipeline commands require the conda env:
 
 ```bash
-.venv/bin/python enumerate_params.py
+conda activate mimic-synth
 ```
 
-Lists all parameters exposed by the OB-Xf VST. Cross-check against `s01_profiles/obxf.yaml` if you update the plugin.
+### 1. Verify the plugin loads
+
+```bash
+python enumerate_params.py
+```
+
+Lists all parameters exposed by the OB-Xf VST.
 
 ### 2. Capture raw audio (S02)
 
-Renders 2^M Sobol-sampled parameter vectors x 5 notes into `s02_capture/data/`. Default M=10 (1,024 vectors = 5,120 captures).
+Renders 2^M Sobol-sampled parameter vectors × N notes into `s02_capture/data/`. Production uses M=14 (16,384 vectors × 15 notes = 245,760 captures).
 
 ```bash
-cd s02_capture
-../.venv/bin/python capture_v1_2.py
+cd s02_capture && python capture_v1_2.py
 ```
 
-The script checkpoints every 50 vectors. If interrupted, re-run and choose **[c]ontinue** to resume.
+Checkpoints every 50 vectors — if interrupted, re-run and choose **[c]ontinue**.
 
-Key capture features (v1.2):
+Key features (v1.2):
 - **Settle-before-patch-change**: drains the old patch's release tail before loading new parameters
 - **Per-note settle**: drains between notes within the same parameter vector
-- **Adaptive settle threshold**: uses measured self-noise floor so self-oscillating patches don't stall the settle loop
-- **Self-noise baseline**: renders 200ms with no MIDI after each patch load; stored in parquet as `self_noise`
-- **Hard reset fallback**: reloads the processing graph + second settle pass when the settle loop times out
+- **Adaptive settle threshold**: uses measured self-noise floor so self-oscillating patches don't stall
+- **Self-noise baseline**: 200ms silent render after each patch load, stored as `self_noise` in parquet
+- **Hard reset fallback**: reloads the graph when the settle loop times out
 
 ### 3. Build the dataset (S03)
 
-Two modes: **live capture** (renders from scratch) or **post-hoc** (reads existing capture, applies quality gates + manifest).
-
-#### Post-hoc (recommended after running capture_v1_2.py)
-
-Reads the existing `samples.parquet` + WAVs, runs quality gates, copies valid captures, and writes a manifest. No DawDreamer required.
+Post-hoc mode reads an existing capture, applies quality gates, and writes a manifest. No re-rendering needed.
 
 ```bash
-.venv/bin/python -m s03_dataset.build_dataset \
+python -m s03_dataset.build_dataset \
     --profile s01_profiles/obxf.yaml \
     --from-capture s02_capture/data/ \
     --out s03_dataset/data/
 ```
 
-#### Live capture (renders from scratch)
-
-Delegates to `capture_v1_2.capture_vector()` with importance weighting, quality gates, and manifest.
+Or live capture from scratch (slower, requires DawDreamer):
 
 ```bash
-.venv/bin/python -m s03_dataset.build_dataset \
-    --profile s01_profiles/obxf.yaml \
-    --m 14 \
-    --out s03_dataset/data/
+python -m s03_dataset.build_dataset \
+    --profile s01_profiles/obxf.yaml --m 14 --out s03_dataset/data/
 ```
 
-`--m 14` generates 2^14 = 16,384 vectors. Use `--m 10` (1,024) for smoke tests.
-
-Optional flags (live capture only):
-- `--seed INT` -- random seed (default `0`)
-- `--importance-mode filter|scale` -- how importance weights are applied (default `filter`)
-
-### 4. Verify the dataset
+Verify the result:
 
 ```bash
-.venv/bin/python -m s03_dataset.verify_dataset \
-    --dataset s02_capture/data/ \
+python -m s03_dataset.verify_dataset \
+    --dataset s03_dataset/data/ --profile s01_profiles/obxf.yaml
+```
+
+### 4. Embed the dataset (S04)
+
+Pre-computes 128-d EnCodec embeddings aligned 1-to-1 with `samples.parquet`.
+
+```bash
+python -m s04_embed.index_dataset \
+    --dataset s03_dataset/data/ --out s04_embed/data/ \
+    --pool mean --batch-size 64
+```
+
+Checkpoints every 500 rows. Verify with:
+
+```bash
+python -m s04_embed.verify_embeddings \
+    --embeddings s04_embed/data/encodec_embeddings.npy \
+    --dataset s03_dataset/data/
+```
+
+### 5. Train the surrogate (S05)
+
+Trains a 4-layer MLP to approximate `f(params, note) → EnCodec latent`.
+
+```bash
+python -m s05_surrogate.train \
+    --dataset s03_dataset/data/samples.parquet \
+    --embeddings s04_embed/data/encodec_embeddings.npy \
+    --out s05_surrogate/runs/
+```
+
+Verify with a full round-trip check on the held-out test split (spec criterion: cos-sim ≥ 0.9):
+
+```bash
+python -m s05_surrogate.verify_surrogate \
+    --checkpoint s05_surrogate/runs/<run_id>/state_dict.pt \
+    --dataset s03_dataset/data/samples.parquet \
+    --embeddings s04_embed/data/encodec_embeddings.npy \
     --profile s01_profiles/obxf.yaml
 ```
 
-Checks every WAV for silence, clipping, stuck notes, and previous-note bleed. Exits non-zero if any failure rate exceeds 1%.
+Current best checkpoint: `runs/run_20260429_145056/` — val loss 0.0061, test-split cos-sim 0.9988.
 
-To dump a CSV of all failed captures:
+### 6. Invert a target sound (S06) ⚠️ WIP
+
+Given a target WAV, finds the OB-Xf parameter vector whose surrogate-predicted embedding is closest to the target. Uses pitch detection to select the best MIDI note, then runs multi-start gradient descent followed by CMA-ES refinement.
 
 ```bash
-.venv/bin/python -m s03_dataset.verify_dataset \
-    --dataset s02_capture/data/ \
+python -m s06_invert.invert \
+    --target path/to/target.wav \
+    --surrogate s05_surrogate/runs/run_20260429_145056/state_dict.pt \
     --profile s01_profiles/obxf.yaml \
-    --dump-failures
+    --out patches/
 ```
 
-Report is written to `tests/reports/verify_dataset/data_<name>_<HHMMSS>.csv`.
+Output: `patches/<target_stem>/best_patch.yaml`, `candidates.parquet`, `target_embedding.npy`.
 
-### 5. Embed the dataset (S04)
-
-Pre-computes EnCodec embeddings for every capture, producing a `encodec_embeddings.npy` file aligned 1-to-1 with `samples.parquet`. No DawDreamer required.
+Render the recovered patch through OB-Xf:
 
 ```bash
-.venv/bin/python -m s04_embed.index_dataset \
-    --dataset s02_capture/data/ \
-    --out s04_embed/data/ \
-    --pool mean
-```
-
-The script checkpoints every 500 rows. If interrupted, re-run and choose **[c]ontinue** to resume where it left off.
-
-Options:
-- `--pool mean` -- 128-d time-averaged vector (default, recommended for surrogate training)
-- `--pool meanstd` -- 256-d vector (mean + std concatenated, richer but larger)
-
-The embedder uses the EnCodec 48 kHz model's continuous pre-quantiser latents (not quantised codes). The checkpoint (~80 MB) downloads automatically on first run.
-
-To verify the embeddings:
-
-```bash
-.venv/bin/python -m s04_embed.verify_embeddings \
-    --embeddings s04_embed/data/encodec_embeddings.npy \
-    --dataset s02_capture/data/
-```
-
-Add `--spot-check` to run a nearest/farthest neighbor quality check (should show similar-sounding captures as nearest neighbors).
-
-### 6. Build sequence data (optional, for temporal models)
-
-Generates interpolated parameter trajectories for training frame-to-frame dynamics.
-
-```bash
-.venv/bin/python -m s03_dataset.sequences \
+python s06_invert/render_stream.py \
+    --patch patches/<target_stem>/best_patch.yaml \
     --profile s01_profiles/obxf.yaml \
-    --out s03_dataset/data/sequences/ \
-    --m 10 \
-    --seconds 5.0 \
-    --control-hz 100
-```
-
-Outputs `sequences.parquet`, `wav/<hash>.wav`, and `params/<hash>.npy`.
-
----
-
-## Shared defaults
-
-Project-wide constants live in `defaults.py` (sample rate, buffer size). Production code reads `sample_rate` from the profile YAML; `defaults.py` provides fallbacks for utility scripts and tests.
-
-The canonical source of truth for audio settings is the profile:
-
-```yaml
-# s01_profiles/obxf.yaml
-probe:
-  sample_rate: 48000
+    --out patches/<target_stem>/rendered.wav
 ```
 
 ---
 
 ## Run tests
 
+Non-integration tests run under `.venv` (no DawDreamer or GPU needed):
+
 ```bash
-.venv/bin/pytest                        # all tests
-.venv/bin/pytest -m "not integration"   # skip tests that require DawDreamer + OB-Xf
+.venv/bin/pytest -m "not integration"
+```
+
+S05/S06 tests require torch — run under conda:
+
+```bash
+conda run -n mimic-synth python -m pytest tests/test_s05_surrogate.py tests/test_invert.py -v
 ```
 
 ---
@@ -182,35 +176,49 @@ probe:
 ## Project structure
 
 ```
-defaults.py              # Shared constants (SAMPLE_RATE, BUFFER_SIZE)
-enumerate_params.py      # Utility: list all VST parameters
+defaults.py                  # Shared constants (SAMPLE_RATE, BUFFER_SIZE)
+enumerate_params.py          # Utility: list all VST parameters
+build_instructions/          # Per-stage design docs (01–08)
 
 s01_profiles/
-  obxf.yaml              # Parameter profile for OB-Xf
+  obxf.yaml                  # OB-Xf parameter profile
 
 s02_capture/
-  capture_v1_2.py        # Current capture rig (v1.2)
-  capture_v1.py          # Legacy v1 (no settle loop)
-  capture_v1-1.py        # Legacy v1.1 (settle after patch change)
-  data/                  # Output: samples.parquet + wav/ (gitignored)
+  capture_v1_2.py            # Current capture rig
+  data/                      # samples.parquet + wav/ (gitignored)
 
 s03_dataset/
-  build_dataset.py       # Dataset builder CLI
-  sampling.py            # Sobol sampling + importance weighting
-  quality.py             # Per-capture quality gates (48 kHz)
-  manifest.py            # Reproducibility manifest (manifest.yaml)
-  sequences.py           # Sequence/trajectory dataset builder
-  verify_dataset.py      # Post-hoc dataset auditor
+  build_dataset.py           # Dataset builder CLI (--from-capture or --m)
+  sampling.py                # Sobol sampling + importance weighting
+  quality.py                 # Per-capture quality gates
+  manifest.py                # Reproducibility manifest
+  sequences.py               # Temporal sequence dataset builder
+  verify_dataset.py          # Post-hoc auditor
+  data/                      # samples.parquet + wav/ (gitignored)
 
 s04_embed/
-  embed.py               # Embedder class (EnCodec + multi-res STFT)
-  index_dataset.py       # Pre-compute embeddings CLI (checkpoint/resume)
-  verify_embeddings.py   # Post-hoc embedding auditor
-  data/                  # Output: encodec_embeddings.npy (gitignored)
+  embed.py                   # Embedder class (EnCodec 48kHz)
+  index_dataset.py           # Pre-compute embeddings CLI
+  verify_embeddings.py       # Post-hoc embedding auditor
+  data/                      # encodec_embeddings.npy (gitignored)
+
+s05_surrogate/
+  model.py                   # Surrogate MLP + SurrogateDataset
+  train.py                   # Training loop CLI
+  verify_surrogate.py        # Round-trip + sweep + gradient checks
+  runs/                      # Checkpoints (gitignored)
+
+s06_invert/
+  grad_search.py             # Multi-start gradient descent
+  cmaes_search.py            # CMA-ES refinement
+  invert.py                  # End-to-end inversion CLI
+  render_stream.py           # Render best_patch.yaml via DawDreamer
+  stream_invert.py           # Sliding-window inversion for long targets
+  validate.py                # Batch validation on held-out test split
 
 tests/
-  test_quality.py
   test_sampling.py
+  test_quality.py
   test_manifest.py
   test_sequences.py
   test_verify_dataset.py
@@ -218,15 +226,14 @@ tests/
   test_capture_v1_2.py
   test_embed.py
   test_embed_index.py
-  test_integration.py
-  reports/               # Generated failure CSVs (gitignored)
+  test_s05_surrogate.py
+  test_invert.py
+  test_integration.py        # Requires DawDreamer + OB-Xf
 ```
 
 ---
 
 ## Profile format
-
-`s01_profiles/obxf.yaml` defines which parameters are sampled and how:
 
 ```yaml
 parameters:
@@ -235,23 +242,35 @@ parameters:
     range: [0.0, 1.0]
     continuous: true
     log_scale: true     # perceptual log mapping for frequency-type params
-    importance: 1.0     # 0 = fixed at reset value, 1 = full range sampled
+    importance: 1.0     # 0 = fixed at reset, 1 = full range sampled
+
+probe:
+  notes: [36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 72, 84]
+  velocity: 100
+  hold_sec: 1.5
+  release_sec: 4.5
+  sample_rate: 48000
 ```
 
-`importance: 0` excludes a parameter from sampling entirely. `log_scale: true` applies a perceptually uniform mapping so low values get finer resolution.
+`importance: 0` excludes a parameter from sampling. `log_scale: true` gives finer resolution at low values.
 
 ---
 
-## Future: hardware synth capture
+## How inversion works
 
-The pipeline is designed to extend beyond DawDreamer/VST hosting. For capturing hardware/analog synths:
+The surrogate learns `f(params, note) → EnCodec latent` from captured data. Inversion asks the reverse question: given a target audio embedding, find the params that minimise cosine distance through the frozen surrogate.
 
-- **MIDI out**: parameter vectors map to CC messages sent to the hardware synth
-- **Audio in**: ASIO/CoreAudio interface captures the synth's analog output
-- **Profile**: same YAML format, with `transport: midi_cc` instead of `vst_host`, plus CC mappings per parameter
-- **Settle loop**: same concept (render/record silence until peak drops), but polls the audio input instead of `engine.get_audio()`
+```
+target.wav → EnCodec → target_embedding [128-d]
+                              ↓
+         search: find params p s.t. surrogate(p, note) ≈ target_embedding
+              ├── multi-start gradient descent (Adam, 16 starts × 300 steps)
+              └── CMA-ES refinement (seeded from best grad result)
+                              ↓
+                    best_patch.yaml  →  DawDreamer  →  rendered.wav
+```
 
-The quality gates (`quality.py`), dataset verifier, and Sobol sampling are transport-agnostic and work unchanged with hardware captures.
+The output is synth knob positions (0–1 per parameter), not MIDI transcription. Load `best_patch.yaml` onto the synth and play the suggested note to hear the result.
 
 ---
 

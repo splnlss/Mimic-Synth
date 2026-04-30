@@ -80,7 +80,7 @@ def build_dataset(
     for u_row in tqdm(vectors, desc="capturing"):
         # Apply importance weighting to the uniform Sobol row
         params = apply_importance(u_row, modulated, profile, mode=importance_mode)
-        vec = np.array([v for _, v in params], dtype=np.float64)
+        vec = np.array([params[k] for k in modulated], dtype=np.float64)
 
         results, _ = capture_vector(
             engine, synth, vec, notes, profile, name_idx,

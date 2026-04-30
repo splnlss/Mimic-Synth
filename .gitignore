@@ -3,6 +3,13 @@ s02_capture/data/
 s03_dataset/data/
 s04_embed/data/
 
+# Surrogate checkpoints — large binaries, not versioned
+s05_surrogate/runs/
+s05_surrogate/train.log
+
+# Inversion outputs
+patches/
+
 # Test reports (generated artefacts)
 tests/reports/
 
@@ -23,6 +30,18 @@ pip-wheel-metadata/
 .venv/
 venv/
 env/
+
+# Secrets and credentials (NEVER commit)
+.env
+.env.local
+.env.*.local
+.env.secret
+*.key
+*.pem
+secrets/
+credentials/
+config.yaml
+*.apikey
 
 # Pytest / coverage
 .pytest_cache/
