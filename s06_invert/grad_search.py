@@ -19,6 +19,7 @@ def grad_invert(
     steps: int = 300,
     lr: float = 5e-2,
     device: str = "cuda",
+    init_params: torch.Tensor | None = None,
 ) -> tuple[float, torch.Tensor]:
     """Find params minimising cosine distance to target_emb.
 
@@ -32,8 +33,14 @@ def grad_invert(
     best_score = float("inf")
     best_params: torch.Tensor | None = None
 
-    for _ in range(n_starts):
-        params = torch.rand(1, d_params, device=device, requires_grad=True)
+    for i in range(n_starts):
+        if init_params is not None and i == 0:
+            if isinstance(init_params, torch.Tensor):
+                params = init_params.clone().unsqueeze(0).to(device).requires_grad_(True)
+            else:
+                params = torch.from_numpy(init_params).clone().unsqueeze(0).to(device).requires_grad_(True)
+        else:
+            params = torch.rand(1, d_params, device=device, requires_grad=True)
         opt = torch.optim.Adam([params], lr=lr)
 
         for _ in range(steps):

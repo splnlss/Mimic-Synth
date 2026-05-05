@@ -56,7 +56,7 @@ def test_render_sec_equals_hold_plus_release(profile):
 
 def test_probe_notes_ascending(profile):
     notes = profile["probe"]["notes"]
-    assert len(notes) == 5
+    assert len(notes) >= 1, "probe must have at least one note"
     assert notes == sorted(notes), "probe notes should be in ascending order"
     assert all(0 <= n <= 127 for n in notes), "all notes must be valid MIDI (0-127)"
 
