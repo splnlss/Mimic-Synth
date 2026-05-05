@@ -1,0 +1,20 @@
+note: 84
+params:
+  p_Amp Env Attack: 0.7678568760553995
+  p_Amp Env Decay: 1.0
+  p_Amp Env Release: 0.0
+  p_Cross Modulation: 0.5323820908864338
+  p_Filter Cutoff: 0.0
+  p_Filter Env Amount: 0.0
+  p_Filter Mode: 0.6111748218536377
+  p_Filter Resonance: 0.8197857141494751
+  p_LFO 1 Rate: 0.8699915409088135
+  p_LFO 1 to Filter Cutoff: 0.4345991313457489
+  p_LFO 1 to Osc 1 Pitch: 1.0
+  p_Osc 1 Pitch: 0.7488786379496255
+  p_Osc 1 Volume: 0.532081330815951
+  p_Osc 2 Detune: 0.8394896984100342
+  p_Osc Pulsewidth: 0.0
+pitch_hz: null
+score: 0.00039374828338623047
+target: /mnt/d/Mimic-Synth-Data/OB-X_Prototype/targets/613846_bird-call-funny.wav

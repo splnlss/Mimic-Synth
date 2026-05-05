@@ -1,0 +1,23 @@
+dataset:
+  created: '2026-05-02T11:31:45+00:00'
+  seed: 0
+  sampler: sobol_scrambled
+  sampler_version: 1.0.0
+  profile_hash: sha256:266f423905fffe1b57df6a591a4de0ba4f1c5283036205a9cc5fbe9fc0a2f3f6
+  capture_rig: v1.2
+  capture_rig_git_sha: 0b5fac3f76be0e960f0c93f39f5b688317700bb4
+  importance_mode: from_capture
+  log_scale_applied: false
+  phases:
+  - name: post_hoc
+    n: 262114
+    seed: null
+    extra:
+      source: /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s02_capture
+  counts:
+    rendered: 262114
+    silent: 1
+    clipped: 0
+    stuck: 0
+    prev_bleed: 0
+    valid: 82148
