@@ -11,11 +11,10 @@ A pipeline for building audio datasets from synthesizers and training models tha
 | S03 | `s03_dataset/` | ⏳ Pending | Dataset builder — Sobol sampling, quality gates, manifest, verifier |
 | S04 | `s04_embed/` | ⏳ Pending | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
 | S05 | `s05_surrogate/` | ✅ Complete | Forward model — MLP mapping (params, note) → EnCodec latent |
-| S06 | `s06_invert/` | ⚠️ WIP | Patch search — grad descent + CMA-ES inversion of target audio |
-| S07 | `s07_refine/` | 🔲 Planned | Refine — close gap between surrogate score and real-synth output |
+| S06 | `s06_invert/` | ✅ Complete | Patch search — grad descent + CMA-ES inversion of target audio |
+| **S06b** | `s06b_live/` | ✅ Working | Streaming inversion v4 — per-region note segmentation, snapped surrogate notes, pinned params, refinement loop |
+| S07 | `s07_refine/` | 🔲 Planned | VST-loop refinement — close the surrogate-to-real cosine-distance gap (see `build_instructions/07 Refine VST Loop.md`) |
 | S08 | `s08_package/` | 🔲 Planned | Package — ONNX export + nn~ / Max/Pd integration |
-
-S03/S04/S05 have dev-scale builds (M=10, 5,120 samples). Production rebuilds are pending S02 completion (~11,373/16,384 vectors done, 69%).
 
 ---
 
@@ -159,14 +158,38 @@ python -m s06_invert.invert --target path/to/target.wav
 
 Output: `s06_invert/patches/<target_stem>/best_patch.yaml`, `candidates.parquet`, `target_embedding.npy`.
 
-Render the recovered patch through OB-Xf:
+### 6b. Streaming inversion for long / multi-pitch targets (S06b) ✅ Working
+
+For targets with pitch changes or sustained notes, use the sliding-window streaming inverter. It segments the target into note regions (energy + pitch-discontinuity at 10 ms resolution), tracks pitch per region, runs warm-start gradient descent through the surrogate, and refines against real VST renders.
 
 ```bash
-python s06_invert/render_stream.py \
-    --patch /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s06_invert/patches/<stem>/best_patch.yaml \
-    --profile s01_profiles/obxf.yaml \
-    --out /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s06_invert/patches/<stem>/rendered.wav
+# Defaults: 100ms window, 50ms hop, 50 grad steps, 4 warm-starts, 3 refine iterations
+conda run -n mimic-synth python -m s06b_live.stream_invert \
+    --target path/to/target.wav
+
+# With custom parameters
+conda run -n mimic-synth python -m s06b_live.stream_invert \
+    --target path/to/target.wav \
+    --win-sec 0.1 --hop-sec 0.05 \
+    --grad-steps 50 --n-starts 4 \
+    --refine-iterations 3
+
+# Direct script invocation also works (sys.path is auto-fixed):
+conda run -n mimic-synth python /home/sanss/Mimic-Synth/s06b_live/stream_invert.py \
+    --target path/to/target.wav
+
+# Skip render + refinement (analysis only)
+conda run -n mimic-synth python -m s06b_live.stream_invert \
+    --target path/to/target.wav --no-render
 ```
+
+Output: `s06_invert/patches/<target_stem>/stream_params.parquet`, `pitch_trajectory.yaml`, `best_patch.yaml`, `rendered.wav`.
+
+Key v4 design decisions (all required to produce audible output that matches the target):
+
+- **Per-region dual MIDI notes** — `midi_note` is the exact integer (sent to DawDreamer for correct pitch playback); `surrogate_note` is snapped to the nearest profile training note (passed to the surrogate so it stays in-distribution and doesn't extrapolate to garbage params).
+- **Pinned parameters during inversion** — `PINNED_PARAMS` in `s06b_live/stream_invert.py` fixes `Osc 1 Pitch=0.5`, `Amp Env Release=0.2`, and `LFO 1 to Osc 1 Pitch=0.0`. Without these pins the surrogate finds degenerate solutions that match the target *embedding* but produce wrong audio (pitch shifted +24 semitones, notes ringing through the entire sample). See the `PINNED_PARAMS` block in the script for the rationale per param.
+- **Sample-accurate render duration** — the render uses `audio_duration = len(target) / sr` so the output WAV matches the target length exactly.
 
 ---
 
@@ -225,6 +248,10 @@ s06_invert/
   stream_invert.py           # Sliding-window inversion for long targets
   validate.py                # Batch validation on held-out test split
 
+s06b_live/
+  stream_invert.py           # v4 streaming inverter — per-region notes,
+                             #   pinned params, real-VST refinement loop
+
 tests/
   test_sampling.py
   test_quality.py
@@ -272,6 +299,8 @@ probe:
 
 The surrogate learns `f(params, note) → EnCodec latent` from captured data. Inversion asks the reverse question: given a target audio embedding, find the params that minimise cosine distance through the frozen surrogate.
 
+**S06 — single-shot inversion (offline)**
+
 ```
 target.wav → EnCodec → target_embedding [128-d]
                               ↓
@@ -282,7 +311,32 @@ target.wav → EnCodec → target_embedding [128-d]
                     best_patch.yaml  →  DawDreamer  →  rendered.wav
 ```
 
-The output is synth knob positions (0–1 per parameter), not MIDI transcription. Load `best_patch.yaml` onto the synth and play the suggested note to hear the result.
+**S06b — streaming, per-region inversion**
+
+```
+target.wav  ─►  energy + pitch-jump segmentation @ 10 ms  ─►  note regions
+                                       ↓
+       per region:  midi_note (exact)  +  surrogate_note (snapped to profile)
+                                       ↓
+   per coarse frame (100 ms win, 50 ms hop):
+       grad_invert(surrogate, target_emb_frame, surrogate_note,
+                   pin_indices = {Osc 1 Pitch=0.5,
+                                  Amp Env Release=0.2,
+                                  LFO 1 to Osc 1 Pitch=0.0})
+                                       ↓
+            stream_params.parquet  +  pitch_trajectory.yaml
+                                       ↓
+   render via DawDreamer (per-region note-on/off, sample-accurate timing)
+                                       ↓
+   refinement loop: render → embed → compare full result → α-search
+                    on per-frame surrogate gradients (pins still applied)
+                                       ↓
+                                rendered.wav
+```
+
+The pinned params are critical: without them the surrogate finds solutions where Osc 1 Pitch is maxed (+24 semitones) and Amp Env Release is held high — producing audio that matches the target embedding but doesn't actually sound like the target.
+
+Output is synth knob positions (0–1 per parameter), not MIDI transcription. Load `best_patch.yaml` onto the synth and play the recovered MIDI note to hear the result.
 
 ---
 
