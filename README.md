@@ -12,8 +12,8 @@ A pipeline for building audio datasets from synthesizers and training models tha
 | S04 | `s04_embed/` | ⏳ Pending | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
 | S05 | `s05_surrogate/` | ✅ Complete | Forward model — MLP mapping (params, note) → EnCodec latent |
 | S06 | `s06_invert/` | ✅ Complete | Patch search — grad descent + CMA-ES inversion of target audio |
-| **S06b** | `s06b_live/` | ✅ Working | Streaming inversion v4 — per-region note segmentation, snapped surrogate notes, pinned params, refinement loop |
-| S07 | `s07_refine/` | 🔲 Planned | VST-loop refinement — close the surrogate-to-real cosine-distance gap (see `build_instructions/07 Refine VST Loop.md`) |
+| **S06b** | `s06b_live/` | ✅ Working | **Inversion** — surrogate-driven: note segmentation, per-region MIDI, PINNED_PARAMS, α-refinement. Fast (~30s). |
+| **S07** | `s07_refine/` | ✅ Working | **Refinement** — real-VST-driven: hill-climb + CMA-ES with osc config scouting. No surrogate. Best quality (~15 min). |
 | S08 | `s08_package/` | 🔲 Planned | Package — ONNX export + nn~ / Max/Pd integration |
 
 ---
@@ -158,38 +158,68 @@ python -m s06_invert.invert --target path/to/target.wav
 
 Output: `s06_invert/patches/<target_stem>/best_patch.yaml`, `candidates.parquet`, `target_embedding.npy`.
 
-### 6b. Streaming inversion for long / multi-pitch targets (S06b) ✅ Working
+### 6b + 7. Inversion (S06b) and Refinement (S07)
 
-For targets with pitch changes or sustained notes, use the sliding-window streaming inverter. It segments the target into note regions (energy + pitch-discontinuity at 10 ms resolution), tracks pitch per region, runs warm-start gradient descent through the surrogate, and refines against real VST renders.
+S06b and S07 are two distinct stages that run in sequence. Understanding the difference helps you pick the right mode:
+
+| | S06b (Inversion) | S07 (Refinement) |
+|---|---|---|
+| **Driven by** | Surrogate neural network | Real OB-Xf renders |
+| **Speed** | ~30 seconds | 5–15 minutes |
+| **Output quality** | cosine dist ~0.10 | cosine dist ~0.03–0.09 |
+| **Use when** | Iterating, previewing | Final render |
+
+**S06b** uses gradient descent through the frozen surrogate — fast because it avoids the VST entirely during search. S06b also includes an α-refinement loop that scales the surrogate's suggested direction by testing a handful of real renders. This alone drops from ~0.21 to ~0.10.
+
+**S07** abandons the surrogate and evaluates every candidate by rendering through OB-Xf. S07 Strategy 1 (hill-climb) does per-param coordinate descent. S07 Strategy 2 (CMA-ES) additionally scouts oscillator waveform configurations (saw, pulse, saw+pulse) and runs a population-based search that learns parameter correlations.
+
+**All targets are automatically converted to mono** — if you pass a stereo file, the pipeline saves `<stem>_mono.wav` alongside it and uses that. For 3+ channels you will be prompted for instructions.
+
+**Each run writes to a timestamped subfolder**: `patches/<target_stem>/YYYYMMDD_HHMMSS/`
+
+#### Mode 1 — Fast (~30s): surrogate inversion + α-refinement only
 
 ```bash
-# Defaults: 100ms window, 50ms hop, 50 grad steps, 4 warm-starts, 3 refine iterations
 conda run -n mimic-synth python -m s06b_live.stream_invert \
-    --target path/to/target.wav
-
-# With custom parameters
-conda run -n mimic-synth python -m s06b_live.stream_invert \
-    --target path/to/target.wav \
-    --win-sec 0.1 --hop-sec 0.05 \
-    --grad-steps 50 --n-starts 4 \
-    --refine-iterations 3
-
-# Direct script invocation also works (sys.path is auto-fixed):
-conda run -n mimic-synth python /home/sanss/Mimic-Synth/s06b_live/stream_invert.py \
-    --target path/to/target.wav
-
-# Skip render + refinement (analysis only)
-conda run -n mimic-synth python -m s06b_live.stream_invert \
-    --target path/to/target.wav --no-render
+    --target path/to/target.wav --hill-iterations 0
 ```
 
-Output: `s06_invert/patches/<target_stem>/stream_params.parquet`, `pitch_trajectory.yaml`, `best_patch.yaml`, `rendered.wav`.
+Good for iteration and checking pitch/timing before committing to a long run.
 
-Key v4 design decisions (all required to produce audible output that matches the target):
+#### Mode 2 — Standard (~5 min): + hill-climb (S07 Strategy 1)
 
-- **Per-region dual MIDI notes** — `midi_note` is the exact integer (sent to DawDreamer for correct pitch playback); `surrogate_note` is snapped to the nearest profile training note (passed to the surrogate so it stays in-distribution and doesn't extrapolate to garbage params).
-- **Pinned parameters during inversion** — `PINNED_PARAMS` in `s06b_live/stream_invert.py` fixes `Osc 1 Pitch=0.5`, `Amp Env Release=0.2`, and `LFO 1 to Osc 1 Pitch=0.0`. Without these pins the surrogate finds degenerate solutions that match the target *embedding* but produce wrong audio (pitch shifted +24 semitones, notes ringing through the entire sample). See the `PINNED_PARAMS` block in the script for the rationale per param.
-- **Sample-accurate render duration** — the render uses `audio_duration = len(target) / sr` so the output WAV matches the target length exactly.
+```bash
+# Default — hill-climb is on (--hill-iterations 2)
+conda run -n mimic-synth python -m s06b_live.stream_invert \
+    --target path/to/target.wav
+```
+
+For each unpinned parameter, tries offsets ±0.05 and ±0.15 globally across all frames; keeps the offset that lowers the real-render cosine distance. Saves `hill_climb_log.yaml` showing which params moved and by how much (useful diagnostic).
+
+#### Mode 3 — Full quality (~15 min): + CMA-ES (S07 Strategy 2)
+
+```bash
+conda run -n mimic-synth python -m s06b_live.stream_invert \
+    --target path/to/target.wav --cmaes
+```
+
+Runs target analysis (spectral centroid, ADSR estimation, harmonic ratio, LFO detection) to answer 5 design questions and warm-start the CMA-ES. Scouts 3 oscillator configs, runs CMA-ES on the best, restarts with larger population if it stagnates. Achieved **0.029 cosine distance** on the crane scream (saw+pulse config, vs 0.21 surrogate-only).
+
+CMA-ES tuning flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--cmaes-sigma0` | 0.08 | Search radius: 0.05=refine, 0.12=explore |
+| `--cmaes-popsize` | 16 | Population per iteration |
+| `--cmaes-maxiter` | 20 | Max iterations before restart |
+
+Output files per run: `stream_params.parquet`, `pitch_trajectory.yaml`, `best_patch.yaml`, `rendered.wav`, `rendered_normalized.wav`, `hill_climb_log.yaml` (if hill-climb ran), `cmaes_log.yaml` (if CMA-ES ran).
+
+Key design constraints (all required for correct audio):
+
+- **`PINNED_PARAMS`** — `Osc 1 Pitch=0.5` (no transpose; pitch comes from MIDI note), `Amp Env Release=0.2` (prevents notes ringing through), `LFO 1 to Osc 1 Pitch=0.0` (no pitch wobble). Without these the surrogate AND the real-synth search both find degenerate solutions.
+- **`surrogate_note`** — detected MIDI note snapped to nearest profile training note for the surrogate context; exact MIDI note used for DawDreamer render. Keeps the surrogate in-distribution.
+- **Reset values applied before every render** — `audio_compare.py` applies all profile reset values first so OB-Xf starts from a known state regardless of previous plugin state.
 
 ---
 
@@ -249,8 +279,18 @@ s06_invert/
   validate.py                # Batch validation on held-out test split
 
 s06b_live/
-  stream_invert.py           # v4 streaming inverter — per-region notes,
-                             #   pinned params, real-VST refinement loop
+  stream_invert.py           # v4 — inversion entry point; all S07 modes
+                             #   wired in via --hill-iterations / --cmaes
+
+s07_refine/
+  mono_utils.py              # ensure_mono(): stereo→mono, 3+ch raises
+  target_analysis.py         # TargetAnalysis: answers 5 design questions
+                             #   (osc type, ADSR, filter, modulation, pitch)
+  audio_compare.py           # render_trajectory() + score_audio(); applies
+                             #   profile reset values before every render
+  vst_hill_climb.py          # Strategy 1: per-param coordinate descent
+  vst_cmaes.py               # Strategy 2: osc config scouting + CMA-ES
+                             #   with IPOP restart
 
 tests/
   test_sampling.py
@@ -311,32 +351,66 @@ target.wav → EnCodec → target_embedding [128-d]
                     best_patch.yaml  →  DawDreamer  →  rendered.wav
 ```
 
-**S06b — streaming, per-region inversion**
+**S06b — Inversion (surrogate-driven, ~30s)**
 
 ```
-target.wav  ─►  energy + pitch-jump segmentation @ 10 ms  ─►  note regions
-                                       ↓
-       per region:  midi_note (exact)  +  surrogate_note (snapped to profile)
-                                       ↓
-   per coarse frame (100 ms win, 50 ms hop):
-       grad_invert(surrogate, target_emb_frame, surrogate_note,
-                   pin_indices = {Osc 1 Pitch=0.5,
-                                  Amp Env Release=0.2,
-                                  LFO 1 to Osc 1 Pitch=0.0})
-                                       ↓
-            stream_params.parquet  +  pitch_trajectory.yaml
-                                       ↓
-   render via DawDreamer (per-region note-on/off, sample-accurate timing)
-                                       ↓
-   refinement loop: render → embed → compare full result → α-search
-                    on per-frame surrogate gradients (pins still applied)
-                                       ↓
-                                rendered.wav
+target.wav  ──► mono conversion (auto)
+                      ↓
+        energy + pitch-jump segmentation @ 10 ms → note regions
+                      ↓
+        per region:  midi_note (exact, → DawDreamer)
+                     surrogate_note (snapped to profile, → surrogate)
+                      ↓
+        per coarse frame (100ms window, 50ms hop):
+            grad_invert(surrogate, frame_emb, surrogate_note,
+                        PINNED_PARAMS = {Osc 1 Pitch=0.5,
+                                         Amp Env Release=0.2,
+                                         LFO 1 to Osc 1 Pitch=0.0})
+                      ↓
+        stream_params.parquet  +  pitch_trajectory.yaml
+                      ↓
+        render (DawDreamer, per-region note-on/off, reset values applied)
+                      ↓
+        α-refinement: surrogate gradient → direction, real renders → scaling
+                      ↓
+        rendered.wav  [cosine dist ≈ 0.10]
 ```
 
-The pinned params are critical: without them the surrogate finds solutions where Osc 1 Pitch is maxed (+24 semitones) and Amp Env Release is held high — producing audio that matches the target embedding but doesn't actually sound like the target.
+**S07 — Refinement (real-VST-driven, ~5–15 min)**
 
-Output is synth knob positions (0–1 per parameter), not MIDI transcription. Load `best_patch.yaml` onto the synth and play the recovered MIDI note to hear the result.
+```
+stream_params.parquet (from S06b)
+                      ↓
+    ┌─── Strategy 1: Hill-climb (default, ~5 min) ───────────────────────┐
+    │  for each unpinned param p:                                         │
+    │      for offset in [-0.15, -0.05, +0.05, +0.15]:                  │
+    │          trial = clip(all_frames[p] + offset, 0, 1)                │
+    │          score = real_render_and_embed(trial)                       │
+    │      keep offset that lowers score                                  │
+    │  repeat until no param improves → hill_climb_log.yaml              │
+    └────────────────────────────────────────────────────────────────────┘
+                      ↓  [cosine dist ≈ 0.09]
+    ┌─── Strategy 2: CMA-ES (--cmaes flag, ~15 min) ─────────────────────┐
+    │  target_analysis: spectral centroid → filter cutoff                 │
+    │                   ADSR shape → Amp Env Attack/Decay                 │
+    │                   harmonic ratio → resonance/cross-mod              │
+    │                   spectral flux → Filter Env Amount / LFO rate      │
+    │                   → smart x0 blended with hill-climb result         │
+    │                                                                      │
+    │  osc config scouting: saw / pulse / saw+pulse × short CMA-ES        │
+    │  → best config (saw+pulse won on crane scream)                       │
+    │                                                                      │
+    │  full CMA-ES on winning config (popsize=16, maxiter=20)             │
+    │  IPOP restart: 1.5× population if stagnating                        │
+    │  → cmaes_log.yaml (param deltas, osc config, n_renders)             │
+    └────────────────────────────────────────────────────────────────────┘
+                      ↓  [cosine dist ≈ 0.03–0.04]
+                  rendered.wav  (timestamped subfolder)
+```
+
+`PINNED_PARAMS` is enforced at every stage. Without them the optimizer shifts pitch +24 semitones and holds notes indefinitely — both produce lower embedding distance but completely wrong audio.
+
+Output is synth knob positions (0–1 per parameter). Load `best_patch.yaml` onto the synth and play the recovered MIDI note to hear the result.
 
 ---
 

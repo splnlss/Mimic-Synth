@@ -27,6 +27,7 @@ if str(_PROJECT_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_PROJECT_ROOT))
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -399,10 +400,19 @@ def stream_invert(
     skip_render: bool = False,
     refine_iterations: int = 3,
     refine_threshold: float = 0.01,
+    hill_iterations: int = 2,
+    hill_offsets: tuple[float, ...] = (-0.15, -0.05, 0.05, 0.15),
+    run_cmaes: bool = False,
+    cmaes_popsize: int = 16,
+    cmaes_maxiter: int = 20,
+    cmaes_sigma0: float = 0.08,
 ) -> dict:
+    # ── Mono enforcement ─────────────────────────────────────────────────────
+    # All target files must be mono before analysis. See s07_refine/mono_utils.py.
+    from s07_refine.mono_utils import ensure_mono
+    _, _, target_wav = ensure_mono(target_wav)
+
     audio, sr = sf.read(str(target_wav), dtype="float32")
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
     audio_duration = len(audio) / sr  # preserved for render length
 
     with open(profile_path) as f:
@@ -540,7 +550,7 @@ def stream_invert(
     best_row = df.loc[df["score"].idxmin()]
 
     # ── Save outputs ─────────────────────────────────────────────────────
-    run_dir = out_dir / target_wav.stem
+    run_dir = out_dir / target_wav.stem / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
     df.to_parquet(run_dir / "stream_params.parquet")
@@ -608,6 +618,39 @@ def stream_invert(
                 audio_duration=audio_duration,
                 max_iterations=refine_iterations,
                 threshold=refine_threshold,
+            )
+
+        if hill_iterations > 0:
+            _hill_climb_step(
+                target_wav=target_wav,
+                profile_path=profile_path,
+                run_dir=run_dir,
+                note_regions=note_regions,
+                param_cols=param_cols,
+                pinned_cols={param_cols[i] for i in pin_idx},
+                embedder=embedder,
+                device=device,
+                audio_duration=audio_duration,
+                n_passes=hill_iterations,
+                offsets=hill_offsets,
+            )
+
+        if run_cmaes:
+            _cmaes_step(
+                target_wav=target_wav,
+                profile_path=profile_path,
+                run_dir=run_dir,
+                note_regions=note_regions,
+                param_cols=param_cols,
+                pinned_cols={param_cols[i] for i in pin_idx},
+                embedder=embedder,
+                device=device,
+                audio_duration=audio_duration,
+                sigma0=cmaes_sigma0,
+                popsize=cmaes_popsize,
+                maxiter=cmaes_maxiter,
+                audio=audio,
+                sr=sr,
             )
 
     return {"df": df, "best": best_row, "run_dir": run_dir}
@@ -888,6 +931,214 @@ def _refine_loop(
         _render_stream(best_df, pitch_traj_refined, profile_path, run_dir, note_regions, audio_duration)
 
 
+# ── Hill-climbing refinement on real VST renders (s07 strategy 1) ───────────
+
+def _hill_climb_step(
+    target_wav: Path,
+    profile_path: Path,
+    run_dir: Path,
+    note_regions: list,
+    param_cols: list[str],
+    pinned_cols: set[str],
+    embedder,
+    device: str,
+    audio_duration: float,
+    n_passes: int,
+    offsets: tuple[float, ...],
+):
+    """Run s07 hill-climbing on the post-α-refinement parquet, then re-render.
+
+    Loads `stream_params.parquet`, embeds the target, hands off to
+    `s07_refine.vst_hill_climb.hill_climb`, persists the improved trajectory,
+    and re-renders. Pinned params are left untouched (the hill-climber skips
+    them via `pinned_cols`).
+    """
+    from s07_refine.vst_hill_climb import hill_climb
+
+    target_audio, sr = sf.read(str(target_wav), dtype="float32")
+    if target_audio.ndim == 2:
+        target_audio = target_audio.mean(axis=1)
+
+    target_emb = embedder.encodec_embed(target_audio, sr, pool="mean")
+    target_emb_t = torch.tensor(target_emb, dtype=torch.float32, device=device)
+
+    df = pd.read_parquet(run_dir / "stream_params.parquet")
+    timestamps = df["timestamp"].values
+    hop_sec = timestamps[1] - timestamps[0] if len(timestamps) > 1 else 0.05
+    total_sec = audio_duration if audio_duration else timestamps[-1] + hop_sec
+
+    print(f"\n=== Hill-climb refinement ({n_passes} pass(es), offsets={list(offsets)}) ===")
+
+    refined_df, final_score, change_log = hill_climb(
+        df=df,
+        note_regions=note_regions,
+        param_cols=param_cols,
+        pinned_cols=pinned_cols,
+        profile_path=profile_path,
+        total_sec=total_sec,
+        target_emb_t=target_emb_t,
+        embedder=embedder,
+        device=device,
+        offsets=offsets,
+        n_passes=n_passes,
+    )
+
+    # Persist updated trajectory + best patch + change log.
+    refined_df.to_parquet(run_dir / "stream_params.parquet")
+
+    best_row = refined_df.loc[refined_df["score"].idxmin()]
+    best_patch = {
+        "target": str(target_wav),
+        "note_regions": [
+            {"onset_sec": r["onset_sec"], "offset_sec": r["offset_sec"],
+             "median_hz": r["median_hz"], "midi_note": r["midi_note"],
+             "surrogate_note": r["surrogate_note"]}
+            for r in note_regions
+        ],
+        "pitch_hz": float(best_row["pitch_hz"]) if pd.notnull(best_row["pitch_hz"]) else None,
+        "score": float(best_row["score"]),
+        "hill_climb_score": float(final_score),
+        "params": {col: float(best_row[col]) for col in param_cols},
+    }
+    with open(run_dir / "best_patch.yaml", "w") as f:
+        yaml.dump(best_patch, f, default_flow_style=False)
+
+    with open(run_dir / "hill_climb_log.yaml", "w") as f:
+        yaml.dump(
+            {"final_score": float(final_score), "moves": change_log},
+            f, default_flow_style=False,
+        )
+
+    # Re-render with the refined params.
+    pitch_traj = {
+        "frames": [
+            {"timestamp": float(row["timestamp"]),
+             "pitch_bend": float(row.get("pitch_bend", 0.5))}
+            for _, row in refined_df.iterrows()
+        ]
+    }
+    print(f"\nRe-rendering hill-climbed result (score={final_score:.4f})...")
+    _render_stream(refined_df, pitch_traj, profile_path, run_dir, note_regions, audio_duration)
+
+
+# ── CMA-ES refinement on real VST renders (s07 strategy 2) ──────────────────
+
+def _cmaes_step(
+    target_wav: Path,
+    profile_path: Path,
+    run_dir: Path,
+    note_regions: list,
+    param_cols: list[str],
+    pinned_cols: set[str],
+    embedder,
+    device: str,
+    audio_duration: float,
+    sigma0: float,
+    popsize: int,
+    maxiter: int,
+    audio: np.ndarray | None = None,
+    sr: int = 48000,
+):
+    """Run s07 CMA-ES on the post-hill-climb parquet, then re-render.
+
+    Loads `stream_params.parquet`, runs target analysis to build a smart x0
+    (blended with the current hill-climb result), then calls
+    `s07_refine.vst_cmaes.cmaes_refine`. Saves updated parquet/yaml/wav and a
+    `cmaes_log.yaml` for diagnostics.
+    """
+    from s07_refine.vst_cmaes import cmaes_refine
+    from s07_refine.target_analysis import analyze_target, suggest_x0, print_analysis
+
+    # Load target audio for analysis (may already be loaded by caller)
+    if audio is None:
+        target_audio, sr = sf.read(str(target_wav), dtype="float32")
+        if target_audio.ndim == 2:
+            target_audio = target_audio.mean(axis=1)
+    else:
+        target_audio = audio
+
+    # Target analysis: answer the 5 design questions
+    print("\n=== Target Analysis (s07 CMA-ES warm-start) ===")
+    analysis = analyze_target(target_audio, sr, note_regions)
+    print_analysis(analysis)
+
+    df = pd.read_parquet(run_dir / "stream_params.parquet")
+
+    # Build smart x0: blend analysis suggestions with current hill-climb result
+    current_x0 = np.array([float(df[c].median()) for c in param_cols])
+    x0_smart = suggest_x0(analysis, param_cols, pinned_cols, current_x0)
+
+    # Apply smart x0 as starting point (write into df so CMA-ES uses it)
+    for i, col in enumerate(param_cols):
+        if col not in pinned_cols:
+            df[col] = np.clip(df[col] + (x0_smart[i] - current_x0[i]) * 0.5, 0.0, 1.0)
+
+    timestamps = df["timestamp"].values
+    hop_sec = timestamps[1] - timestamps[0] if len(timestamps) > 1 else 0.05
+    total_sec = audio_duration if audio_duration else timestamps[-1] + hop_sec
+
+    print(f"\n=== CMA-ES refinement (popsize={popsize}, maxiter={maxiter}) ===")
+
+    result = cmaes_refine(
+        df=df,
+        note_regions=note_regions,
+        param_cols=param_cols,
+        pinned_cols=pinned_cols,
+        profile_path=profile_path,
+        total_sec=total_sec,
+        target_wav=target_wav,
+        embedder=embedder,
+        device=device,
+        sigma0=sigma0,
+        popsize=popsize,
+        maxiter=maxiter,
+    )
+
+    # Persist
+    result.best_df.to_parquet(run_dir / "stream_params.parquet")
+    best_row = result.best_df.loc[result.best_df["score"].idxmin()]
+    best_patch = {
+        "target": str(target_wav),
+        "note_regions": [
+            {"onset_sec": r["onset_sec"], "offset_sec": r["offset_sec"],
+             "median_hz": r["median_hz"], "midi_note": r["midi_note"],
+             "surrogate_note": r["surrogate_note"]}
+            for r in note_regions
+        ],
+        "pitch_hz": float(best_row["pitch_hz"]) if pd.notnull(best_row["pitch_hz"]) else None,
+        "score": float(best_row["score"]),
+        "cmaes_score": float(result.best_score),
+        "osc_config": result.osc_config,
+        "params": {col: float(best_row[col]) for col in param_cols},
+    }
+    with open(run_dir / "best_patch.yaml", "w") as f:
+        yaml.dump(best_patch, f, default_flow_style=False)
+
+    cmaes_log = {
+        "final_score": float(result.best_score),
+        "osc_config": result.osc_config,
+        "n_renders": result.n_renders,
+        "restarts_used": result.restarts_used,
+        "param_deltas": {k: float(v) for k, v in result.param_deltas.items()},
+        "iterations": result.iteration_log,
+    }
+    with open(run_dir / "cmaes_log.yaml", "w") as f:
+        yaml.dump(cmaes_log, f, default_flow_style=False)
+
+    # Re-render with best params
+    pitch_traj = {
+        "frames": [
+            {"timestamp": float(row["timestamp"]),
+             "pitch_bend": float(row.get("pitch_bend", 0.5))}
+            for _, row in result.best_df.iterrows()
+        ]
+    }
+    print(f"\nRe-rendering CMA-ES result (score={result.best_score:.4f}, "
+          f"config='{result.osc_config}')...")
+    _render_stream(result.best_df, pitch_traj, profile_path, run_dir,
+                   note_regions, audio_duration)
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -903,10 +1154,23 @@ if __name__ == "__main__":
     ap.add_argument("--smooth-window", type=int, default=3)
     ap.add_argument("--device", default="cuda", help="torch device")
     ap.add_argument("--no-render", action="store_true", help="Skip DawDreamer render step")
-    ap.add_argument("--refine-iterations", type=int, default=3)
+    ap.add_argument("--refine-iterations", type=int, default=3,
+                    help="α-search refinement iterations (surrogate-gradient driven)")
     ap.add_argument("--refine-threshold", type=float, default=0.01)
+    ap.add_argument("--hill-iterations", type=int, default=2,
+                    help="s07 hill-climb passes on real VST renders (0 to disable)")
+    ap.add_argument("--hill-offsets", type=str, default="-0.15,-0.05,0.05,0.15",
+                    help="comma-separated list of per-param offsets to try each pass")
+    ap.add_argument("--cmaes", action="store_true",
+                    help="run s07 CMA-ES after hill-climb (requires: pip install cma)")
+    ap.add_argument("--cmaes-popsize", type=int, default=16)
+    ap.add_argument("--cmaes-maxiter", type=int, default=20)
+    ap.add_argument("--cmaes-sigma0", type=float, default=0.08,
+                    help="CMA-ES step size (0.05=refine, 0.10-0.15=explore)")
 
     args = ap.parse_args()
+
+    hill_offsets = tuple(float(x) for x in args.hill_offsets.split(",") if x.strip())
 
     if args.surrogate is None:
         runs = sorted(_defs.S05_RUNS_DIR.glob("run_*")) if _defs.S05_RUNS_DIR.exists() else []
@@ -931,4 +1195,10 @@ if __name__ == "__main__":
         skip_render=args.no_render,
         refine_iterations=args.refine_iterations,
         refine_threshold=args.refine_threshold,
+        hill_iterations=args.hill_iterations,
+        hill_offsets=hill_offsets,
+        run_cmaes=args.cmaes,
+        cmaes_popsize=args.cmaes_popsize,
+        cmaes_maxiter=args.cmaes_maxiter,
+        cmaes_sigma0=args.cmaes_sigma0,
     )
