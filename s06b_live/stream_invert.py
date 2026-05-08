@@ -1111,8 +1111,8 @@ def _refine_loop(
     target_emb = embedder.encodec_embed(target_audio, sr, pool="mean")
     target_emb_torch = torch.tensor(target_emb, dtype=torch.float32).to(device)
 
-    from s07_refine.audio_compare import compute_mrstft_features, compute_ap_features, score_audio_composite
-    target_mrstft = compute_mrstft_features(target_audio)
+    from s07_refine.audio_compare import compute_ap_features, score_audio_composite
+    target_mrstft_audio = target_audio
     target_ap = compute_ap_features(target_audio, sr)
 
     def _render_and_score(current_df):
@@ -1143,7 +1143,7 @@ def _refine_loop(
 
         score = score_audio_composite(
             rendered, sr_profile, target_emb_torch, embedder, device,
-            target_mrstft, target_ap,
+            target_mrstft_audio, target_ap,
         )
         return score, rendered
 
@@ -1281,7 +1281,7 @@ def _hill_climb_step(
     them via `pinned_cols`).
     """
     from s07_refine.vst_hill_climb import hill_climb
-    from s07_refine.audio_compare import compute_mrstft_features, compute_ap_features
+    from s07_refine.audio_compare import compute_ap_features
 
     target_audio, sr = sf.read(str(target_wav), dtype="float32")
     if target_audio.ndim == 2:
@@ -1289,7 +1289,7 @@ def _hill_climb_step(
 
     target_emb = embedder.encodec_embed(target_audio, sr, pool="mean")
     target_emb_t = torch.tensor(target_emb, dtype=torch.float32, device=device)
-    target_mrstft = compute_mrstft_features(target_audio)
+    target_mrstft_audio = target_audio
     target_ap = compute_ap_features(target_audio, sr)
 
     active = "EnCodec+MRSTFT" + ("+AP" if target_ap is not None else "")
@@ -1313,7 +1313,7 @@ def _hill_climb_step(
         device=device,
         offsets=offsets,
         n_passes=n_passes,
-        target_mrstft=target_mrstft,
+        target_mrstft_audio=target_mrstft_audio,
         target_ap=target_ap,
     )
 

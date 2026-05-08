@@ -61,7 +61,6 @@ from s07_refine.audio_compare import (
     render_region_and_score,
     score_audio,
     score_audio_composite,
-    compute_mrstft_features,
     compute_ap_features,
 )
 
@@ -207,7 +206,7 @@ def cmaes_refine(
         embedder.encodec_embed(target_audio, sr_t, pool="mean"),
         dtype=torch.float32, device=device,
     )
-    full_target_mrstft = compute_mrstft_features(target_audio)
+    full_target_mrstft = target_audio  # raw audio; auraloss computes MRSTFT in score_audio_composite
     full_target_ap = compute_ap_features(target_audio, int(sr_t))  # None if pyworld absent
 
     active = "EnCodec+MRSTFT" + ("+AP" if full_target_ap is not None else "")
@@ -218,7 +217,7 @@ def cmaes_refine(
     best_osc_config, scout_renders = _scout_osc_configs(
         df=df, all_param_cols=all_param_cols, pinned_cols=pinned_cols,
         note_regions=note_regions, profile_path=profile_path, total_sec=total_sec,
-        target_emb_t=full_target_emb_t, target_mrstft=full_target_mrstft,
+        target_emb_t=full_target_emb_t, target_mrstft_audio=full_target_mrstft,
         target_ap=full_target_ap, embedder=embedder, device=device,
         sigma0=sigma0 * 1.5, extra_bounds=extra_bounds, verbose=verbose, cma=cma,
     )
@@ -230,7 +229,7 @@ def cmaes_refine(
     shared = dict(
         df=df, all_param_cols=all_param_cols, pinned_cols=pinned_cols,
         note_regions=note_regions, profile_path=profile_path, total_sec=total_sec,
-        target_emb_t=full_target_emb_t, target_mrstft=full_target_mrstft,
+        target_emb_t=full_target_emb_t, target_mrstft_audio=full_target_mrstft,
         target_ap=full_target_ap,
         embedder=embedder, device=device,
         extra_osc=extra_osc, sigma0=sigma0, popsize=popsize, maxiter=maxiter,
@@ -243,19 +242,19 @@ def cmaes_refine(
 
     elif mode == "per-region":
         region_embs = _compute_region_embs(target_audio, sr_t, note_regions, embedder, device, full_target_emb_t)
-        region_mrstfts = _compute_region_mrstfts(target_audio, sr_t, note_regions, full_target_mrstft)
+        region_mrstft_audios = _slice_region_audio(target_audio, sr_t, note_regions, full_target_mrstft)
         region_aps = _compute_region_aps(target_audio, int(sr_t), note_regions, full_target_ap)
         result_df, region_scores, global_score, n_renders, restarts, log = _run_per_region(
-            **shared, region_embs=region_embs, region_mrstfts=region_mrstfts,
+            **shared, region_embs=region_embs, region_mrstft_audios=region_mrstft_audios,
             region_aps=region_aps, crossfade_sec=crossfade_sec, sr=sr_t,
         )
 
     else:  # hybrid
         region_embs = _compute_region_embs(target_audio, sr_t, note_regions, embedder, device, full_target_emb_t)
-        region_mrstfts = _compute_region_mrstfts(target_audio, sr_t, note_regions, full_target_mrstft)
+        region_mrstft_audios = _slice_region_audio(target_audio, sr_t, note_regions, full_target_mrstft)
         region_aps = _compute_region_aps(target_audio, int(sr_t), note_regions, full_target_ap)
         result_df, region_scores, global_score, n_renders, restarts, log = _run_hybrid(
-            **shared, region_embs=region_embs, region_mrstfts=region_mrstfts,
+            **shared, region_embs=region_embs, region_mrstft_audios=region_mrstft_audios,
             region_aps=region_aps, min_region_sec=min_region_sec,
             per_region_improvement=per_region_improvement,
             crossfade_sec=crossfade_sec, sr=sr_t,
@@ -311,7 +310,7 @@ def _make_bounds(free_cols: list[str], extra_bounds: dict[str, tuple[float, floa
 
 def _run_global(
     df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
-    target_emb_t, target_mrstft, target_ap, embedder, device, extra_osc,
+    target_emb_t, target_mrstft_audio, target_ap, embedder, device, extra_osc,
     sigma0, popsize, maxiter, extra_bounds, verbose, cma,
 ) -> tuple[pd.DataFrame, float, int, int, list]:
     """Single CMA-ES over global per-param offsets. The clean bypass path."""
@@ -325,7 +324,7 @@ def _run_global(
         objective=lambda x: _score_global(
             x, free_cols, pinned_cols, x0_median, df, all_param_cols,
             note_regions, profile_path, total_sec, target_emb_t, embedder, device,
-            extra_osc, target_mrstft, target_ap,
+            extra_osc, target_mrstft_audio, target_ap,
         ),
         x0=x0_free, n_dims=len(x0_free), bounds=(lo, hi),
         sigma0=sigma0, popsize=popsize, maxiter=maxiter,
@@ -335,7 +334,7 @@ def _run_global(
     result_df = _apply_global_offsets(df, best_x, free_cols, x0_median, all_param_cols, pinned_cols)
 
     audio, sr = render_trajectory(result_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
-    global_score = score_audio_composite(audio, sr, target_emb_t, embedder, device, target_mrstft, target_ap)
+    global_score = score_audio_composite(audio, sr, target_emb_t, embedder, device, target_mrstft_audio, target_ap)
     n_renders += 1
 
     return result_df, global_score, n_renders, restarts, log
@@ -345,7 +344,7 @@ def _run_global(
 
 def _run_per_region(
     df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
-    target_emb_t, target_mrstft, target_ap, region_embs, region_mrstfts, region_aps,
+    target_emb_t, target_mrstft_audio, target_ap, region_embs, region_mrstft_audios, region_aps,
     embedder, device, extra_osc, sigma0, popsize, maxiter, extra_bounds,
     crossfade_sec, sr, verbose, cma,
 ) -> tuple[pd.DataFrame, list[float], float, int, int, list]:
@@ -376,11 +375,11 @@ def _run_per_region(
         x0_free = np.clip([x0_reg.get(c, 0.5) for c in free_cols], lo_r, hi_r).astype(np.float64)
         best_x, best_score, n, restarts, log = _ipop_cmaes(
             objective=lambda x, _note=reg_note, _dur=reg_dur, \
-                    _emb=region_embs[reg_idx], _mrstft=region_mrstfts[reg_idx], \
+                    _emb=region_embs[reg_idx], _mrstft_audio=region_mrstft_audios[reg_idx], \
                     _ap=region_aps[reg_idx]: \
                 _score_region(x, free_cols, pinned_cols, x0_reg,
                               _note, _dur, profile_path, _emb, embedder, device,
-                              extra_osc, _mrstft, _ap),
+                              extra_osc, _mrstft_audio, _ap),
             x0=x0_free, n_dims=len(x0_free), bounds=(lo_r, hi_r),
             sigma0=sigma0, popsize=popsize, maxiter=maxiter,
             score_target=0.03, verbose=verbose, verbose_prefix="    ", cma=cma,
@@ -401,7 +400,7 @@ def _run_per_region(
     result_df = _stitch_with_crossfade(df, note_regions, region_best_params, all_param_cols, crossfade_sec, sr)
 
     audio, sr_r = render_trajectory(result_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
-    global_score = score_audio_composite(audio, sr_r, target_emb_t, embedder, device, target_mrstft, target_ap)
+    global_score = score_audio_composite(audio, sr_r, target_emb_t, embedder, device, target_mrstft_audio, target_ap)
     total_renders += 1
 
     return result_df, region_scores, global_score, total_renders, total_restarts, all_logs
@@ -411,7 +410,7 @@ def _run_per_region(
 
 def _run_hybrid(
     df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
-    target_emb_t, target_mrstft, target_ap, region_embs, region_mrstfts, region_aps,
+    target_emb_t, target_mrstft_audio, target_ap, region_embs, region_mrstft_audios, region_aps,
     embedder, device, extra_osc, sigma0, popsize, maxiter, extra_bounds,
     min_region_sec, per_region_improvement, crossfade_sec, sr, verbose, cma,
 ) -> tuple[pd.DataFrame, list[float], float, int, int, list]:
@@ -421,7 +420,7 @@ def _run_hybrid(
 
     result_df, global_score, n1, restarts1, log1 = _run_global(
         df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
-        target_emb_t, target_mrstft, target_ap, embedder, device, extra_osc,
+        target_emb_t, target_mrstft_audio, target_ap, embedder, device, extra_osc,
         sigma0=sigma0, popsize=popsize, maxiter=maxiter,
         extra_bounds=extra_bounds, verbose=verbose, cma=cma,
     )
@@ -461,7 +460,7 @@ def _run_hybrid(
         baseline_region_score = render_region_and_score(
             global_params_named, reg_note, reg_dur, profile_path,
             region_embs[reg_idx], embedder, device, extra_osc,
-            target_mrstft=region_mrstfts[reg_idx],
+            target_mrstft_audio=region_mrstft_audios[reg_idx],
             target_ap=region_aps[reg_idx],
         )
         n2 += 1
@@ -477,11 +476,11 @@ def _run_hybrid(
 
         best_x, best_score, n, restarts, log = _ipop_cmaes(
             objective=lambda x, _note=reg_note, _dur=reg_dur, \
-                    _emb=region_embs[reg_idx], _mrstft=region_mrstfts[reg_idx], \
+                    _emb=region_embs[reg_idx], _mrstft_audio=region_mrstft_audios[reg_idx], \
                     _ap=region_aps[reg_idx]: \
                 _score_region(x, free_cols, pinned_cols, x0_reg,
                               _note, _dur, profile_path, _emb, embedder, device,
-                              extra_osc, _mrstft, _ap),
+                              extra_osc, _mrstft_audio, _ap),
             x0=x0_free, n_dims=len(x0_free), bounds=(lo_r, hi_r),
             sigma0=sigma0 * 0.7, popsize=max(8, popsize // 2), maxiter=maxiter,
             score_target=0.03, verbose=verbose, verbose_prefix="    ", cma=cma,
@@ -528,7 +527,7 @@ def _run_hybrid(
         audio, sr_r = render_trajectory(
             result_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc
         )
-        final_score = score_audio_composite(audio, sr_r, target_emb_t, embedder, device, target_mrstft, target_ap)
+        final_score = score_audio_composite(audio, sr_r, target_emb_t, embedder, device, target_mrstft_audio, target_ap)
         n2 += 1
         if verbose:
             print(f"\n  Hybrid final global score: {final_score:.4f} "
@@ -633,17 +632,17 @@ def _run_cmaes_once(
 def _score_global(
     x_free, free_cols, pinned_cols, x0_median, df, all_param_cols,
     note_regions, profile_path, total_sec, target_emb_t, embedder, device,
-    extra_osc, target_mrstft=None, target_ap=None,
+    extra_osc, target_mrstft_audio=None, target_ap=None,
 ) -> float:
     trial_df = _apply_global_offsets(df, x_free, free_cols, x0_median, all_param_cols, pinned_cols)
     audio, sr = render_trajectory(trial_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
-    return score_audio_composite(audio, sr, target_emb_t, embedder, device, target_mrstft, target_ap)
+    return score_audio_composite(audio, sr, target_emb_t, embedder, device, target_mrstft_audio, target_ap)
 
 
 def _score_region(
     x_free, free_cols, pinned_cols, x0_dict, note, region_dur,
     profile_path, target_emb_t, embedder, device, extra_osc,
-    target_mrstft=None, target_ap=None,
+    target_mrstft_audio=None, target_ap=None,
 ) -> float:
     params = x0_dict.copy()
     for i, col in enumerate(free_cols):
@@ -652,7 +651,7 @@ def _score_region(
     return render_region_and_score(
         params_named, note, region_dur, profile_path,
         target_emb_t, embedder, device, extra_osc,
-        target_mrstft=target_mrstft, target_ap=target_ap,
+        target_mrstft_audio=target_mrstft_audio, target_ap=target_ap,
     )
 
 
@@ -730,7 +729,7 @@ def _stitch_with_crossfade(
 
 def _scout_osc_configs(
     df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
-    target_emb_t, target_mrstft, target_ap, embedder, device, sigma0, extra_bounds, verbose, cma,
+    target_emb_t, target_mrstft_audio, target_ap, embedder, device, sigma0, extra_bounds, verbose, cma,
 ) -> tuple[str, int]:
     free_cols = [c for c in all_param_cols if c not in pinned_cols]
     x0_median = {c: float(df[c].median()) if c in df.columns else 0.5 for c in all_param_cols}
@@ -749,7 +748,7 @@ def _scout_osc_configs(
             objective=lambda x, _osc=osc_extra: _score_global(
                 x, free_cols, pinned_cols, x0_median, df, all_param_cols,
                 note_regions, profile_path, total_sec, target_emb_t, embedder, device, _osc,
-                target_mrstft=target_mrstft, target_ap=target_ap,
+                target_mrstft_audio=target_mrstft_audio, target_ap=target_ap,
             ),
             x0=x0_free.copy(), n_dims=len(x0_free), bounds=(lo_s, hi_s),
             sigma0=sigma0, popsize=SCOUT_POPSIZE, maxiter=SCOUT_MAXITER,
@@ -765,28 +764,30 @@ def _scout_osc_configs(
     return best_config, total_renders
 
 
-# ── Region embedding / MRSTFT helpers ────────────────────────────────────────
+# ── Region embedding / audio helpers ─────────────────────────────────────────
 
-def _compute_region_mrstfts(
+def _slice_region_audio(
     target_audio: np.ndarray,
     sr_t: int,
     note_regions: list[dict],
-    fallback_mrstft: np.ndarray,
+    fallback_audio: np.ndarray,
     min_samples: int | None = None,
 ) -> list[np.ndarray]:
-    """MRSTFT features for each note region; falls back to full-audio features."""
+    """Raw audio slice per note region; falls back to full-audio when too short.
+
+    The returned segments are passed directly to score_audio_composite as
+    target_mrstft_audio — auraloss computes the MRSTFT distance on-the-fly.
+    250ms minimum ensures stable multi-scale STFT at the 256-sample window.
+    """
     if min_samples is None:
-        min_samples = int(0.25 * sr_t)  # ~250ms minimum for stable std estimate
-    mrstfts = []
+        min_samples = int(0.25 * sr_t)  # ~250ms minimum
+    segs = []
     for r in note_regions:
         s = int(r["onset_sec"] * sr_t)
         e = int(r["offset_sec"] * sr_t)
         seg = target_audio[s:e]
-        if len(seg) >= min_samples:
-            mrstfts.append(compute_mrstft_features(seg))
-        else:
-            mrstfts.append(fallback_mrstft)
-    return mrstfts
+        segs.append(seg if len(seg) >= min_samples else fallback_audio)
+    return segs
 
 
 def _compute_region_aps(

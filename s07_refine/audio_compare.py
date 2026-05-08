@@ -10,20 +10,15 @@ columns, plus a list of note_regions. This is exactly the shape produced by
 `s06b_live.stream_invert.stream_invert()` and persisted to
 `stream_params.parquet`, so refinement modules can consume that file directly.
 
-Composite scoring (EnCodec + MRSTFT)
--------------------------------------
+Composite scoring (EnCodec + MRSTFT + AP)
+------------------------------------------
 `score_audio` uses EnCodec cosine distance only (fast, high-level timbre).
-`score_audio_composite` blends EnCodec (60%) with MRSTFT (40%).
+`score_audio_composite` blends EnCodec (50%), MRSTFT (30%), AP (20%).
 
-The MRSTFT term captures what EnCodec misses:
-  - Noise texture and inharmonic "air" content
-  - Filter movement (temporal spectral variation / std across frames)
-  - Attack transients and release character (pitch drop, spectral thickening)
-
-MRSTFT features: at each of 4 FFT sizes (256/512/1024/2048 samples), compute
-log-magnitude STFT and take the per-bin mean and std across time frames.
-Mean = spectral shape; std = temporal variation (filter sweep, transient energy).
-Total feature dim: sum of 2*(n_fft//2+1) for each n_fft = 3848.
+The MRSTFT term uses auraloss.freq.MultiResolutionSTFTLoss — a differentiable
+multi-scale spectral loss at FFT sizes 256/512/1024/2048. It captures what
+EnCodec misses: noise texture, filter movement, attack transients, and release
+character. Loss is normalized to approx [0, 2] to match cosine distance scale.
 """
 from __future__ import annotations
 
@@ -34,11 +29,20 @@ _PROJECT_ROOT = _Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_PROJECT_ROOT))
 
+import auraloss.freq as _auraf
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 import yaml
+
+_MRSTFT_LOSS = _auraf.MultiResolutionSTFTLoss(
+    fft_sizes=[256, 512, 1024, 2048],
+    hop_sizes=[64, 128, 256, 512],
+    win_lengths=[256, 512, 1024, 2048],
+    window="hann_window",
+)
+_MRSTFT_LOSS.eval()
 
 # Composite scoring weights.
 # EnCodec: high-level timbre color and resonance.
@@ -50,45 +54,26 @@ MRSTFT_WEIGHT: float = 0.30
 AP_WEIGHT: float = 0.20
 
 
-def _stft(audio: np.ndarray, n_fft: int, hop: int) -> np.ndarray:
-    """Real-valued STFT returning magnitude [freq_bins, frames]."""
-    window = np.hanning(n_fft)
-    n_frames = 1 + (len(audio) - n_fft) // hop
-    if n_frames <= 0:
-        return np.zeros((n_fft // 2 + 1, 0), dtype=np.float32)
-    out = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.float32)
-    for i in range(n_frames):
-        frame = audio[i * hop : i * hop + n_fft] * window
-        out[:, i] = np.abs(np.fft.rfft(frame)).astype(np.float32)
-    return out
+_MRSTFT_N_TERMS = 2 * len([256, 512, 1024, 2048])  # SpectralConvergence + LogMagnitude per scale = 8
 
 
-def compute_mrstft_features(audio: np.ndarray, fft_sizes=(256, 512, 1024, 2048)) -> np.ndarray:
-    """Multi-resolution STFT: per-bin log-magnitude mean and std across time.
+def _mrstft_dist(audio_a: np.ndarray, audio_b: np.ndarray) -> float:
+    """auraloss MultiResolutionSTFTLoss normalized to approx [0, 2].
 
-    Mean captures spectral shape (filter cutoff position, harmonic content).
-    Std captures temporal variation: filter sweeps, attack transients, noise
-    bursts, and pitch-drop release thickening — the exact qualities EnCodec
-    embeddings are blind to.
-
-    Returns a float32 1-D array of length sum(2*(n_fft//2+1)) = 3848.
-    Falls back to zeros for audio shorter than the smallest FFT window;
-    cosine_distance(zeros, zeros) = 1 (neutral, not harmful).
+    Returns 1.0 (neutral) when either clip is shorter than the smallest
+    FFT window (256 samples). Divides raw loss by number of terms (8) so
+    that typical "good match" values land near 0.02–0.2, matching the
+    cosine distance scale used by the EnCodec and AP terms.
     """
-    audio = audio.astype(np.float32)
-    feats: list[np.ndarray] = []
-    for n_fft in fft_sizes:
-        hop = n_fft // 4
-        n_bins = n_fft // 2 + 1
-        if len(audio) < n_fft:
-            feats.append(np.zeros(n_bins, dtype=np.float32))  # mean
-            feats.append(np.zeros(n_bins, dtype=np.float32))  # std
-            continue
-        spec = _stft(audio, n_fft=n_fft, hop=hop)            # [bins, frames]
-        log_spec = np.log1p(spec)
-        feats.append(log_spec.mean(axis=1))                   # spectral shape
-        feats.append(log_spec.std(axis=1))                    # temporal variation
-    return np.concatenate(feats).astype(np.float32)
+    if len(audio_a) < 256 or len(audio_b) < 256:
+        return 1.0
+    ta = torch.from_numpy(audio_a.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    tb = torch.from_numpy(audio_b.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    length = min(ta.shape[-1], tb.shape[-1])
+    ta, tb = ta[..., :length], tb[..., :length]
+    with torch.no_grad():
+        loss = _MRSTFT_LOSS(ta, tb).item()
+    return min(2.0, loss / _MRSTFT_N_TERMS)
 
 
 def compute_ap_features(audio: np.ndarray, sr: int) -> np.ndarray | None:
@@ -142,14 +127,14 @@ def score_audio_composite(
     target_emb_t: torch.Tensor,
     embedder,
     device: str,
-    target_mrstft: np.ndarray | None = None,
+    target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
 ) -> float:
     """Composite score: EnCodec + MRSTFT + AP (aperiodicity), renormalised.
 
     Active terms and their base weights:
         EnCodec  50%  — high-level timbral color and resonance
-        MRSTFT   30%  — filter movement, temporal spectral variation
+        MRSTFT   30%  — filter movement, temporal spectral variation (auraloss)
         AP       20%  — noise-vs-harmonic balance (squaky, breathy quality)
 
     Inactive terms (None) are dropped and the remaining weights are
@@ -158,9 +143,8 @@ def score_audio_composite(
     enc_dist = score_audio(audio, sr, target_emb_t, embedder, device)
     terms: list[tuple[float, float]] = [(ENCODEC_WEIGHT, enc_dist)]
 
-    if target_mrstft is not None:
-        cand_mrstft = compute_mrstft_features(audio)
-        terms.append((MRSTFT_WEIGHT, _cosine_dist(target_mrstft, cand_mrstft)))
+    if target_mrstft_audio is not None:
+        terms.append((MRSTFT_WEIGHT, _mrstft_dist(audio, target_mrstft_audio)))
 
     if target_ap is not None:
         cand_ap = compute_ap_features(audio, sr)
@@ -364,14 +348,14 @@ def render_region_and_score(
     embedder,
     device: str,
     extra_params: dict[str, float] | None = None,
-    target_mrstft: np.ndarray | None = None,
+    target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
 ) -> float:
     """Render a region and return composite distance (EnCodec + MRSTFT + AP)."""
     audio, sr = render_region(params, note, region_dur, profile_path,
                               extra_params=extra_params)
     return score_audio_composite(audio, sr, target_emb_t, embedder, device,
-                                 target_mrstft, target_ap)
+                                 target_mrstft_audio, target_ap)
 
 
 def render_and_score(
@@ -384,7 +368,7 @@ def render_and_score(
     embedder,
     device: str,
     extra_params: dict[str, float] | None = None,
-    target_mrstft: np.ndarray | None = None,
+    target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """Convenience: render `df` and return (score, audio)."""
@@ -392,5 +376,5 @@ def render_and_score(
         df, note_regions, param_cols, profile_path, total_sec, extra_params
     )
     score = score_audio_composite(audio, sr, target_emb_t, embedder, device,
-                                  target_mrstft, target_ap)
+                                  target_mrstft_audio, target_ap)
     return score, audio
