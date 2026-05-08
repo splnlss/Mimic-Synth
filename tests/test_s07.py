@@ -370,6 +370,82 @@ class TestCMAESLogic:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# MRSTFT feature tests (numpy only, no DawDreamer or GPU)
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestMRSTFT:
+    """Tests for compute_mrstft_features in audio_compare.py."""
+
+    def setup_method(self):
+        from s07_refine.audio_compare import compute_mrstft_features
+        self.mrstft = compute_mrstft_features
+
+    def test_output_shape(self):
+        """Feature vector length = sum(2*(n_fft//2+1)) for ffts 256/512/1024/2048."""
+        audio = np.random.randn(SR).astype(np.float32)
+        feats = self.mrstft(audio)
+        expected_len = sum(2 * (n // 2 + 1) for n in (256, 512, 1024, 2048))
+        assert feats.shape == (expected_len,), \
+            f"Expected ({expected_len},), got {feats.shape}"
+
+    def test_dtype_is_float32(self):
+        audio = np.random.randn(SR).astype(np.float32)
+        feats = self.mrstft(audio)
+        assert feats.dtype == np.float32
+
+    def test_no_nan_or_inf(self):
+        audio = _sine(440.0, 1.0)
+        feats = self.mrstft(audio)
+        assert np.all(np.isfinite(feats)), "MRSTFT features contain NaN or Inf"
+
+    def test_short_audio_returns_zeros(self):
+        """Audio shorter than smallest n_fft (256) → all-zero feature vector."""
+        audio = np.zeros(100, dtype=np.float32)
+        feats = self.mrstft(audio)
+        assert np.all(feats == 0.0), "Short audio should produce all-zero features"
+
+    def test_noise_has_nonzero_std(self):
+        """White noise has non-zero temporal variation (std bins > 0)."""
+        audio = np.random.randn(SR).astype(np.float32)
+        feats = self.mrstft(audio)
+        n_bins_first = 256 // 2 + 1  # mean bins for first FFT size
+        # std features start at index n_bins_first
+        std_bins = feats[n_bins_first: 2 * n_bins_first]
+        assert std_bins.max() > 0.0, "Noise should have non-zero temporal std"
+
+    def test_silence_is_all_zeros(self):
+        audio = np.zeros(SR, dtype=np.float32)
+        feats = self.mrstft(audio)
+        assert np.allclose(feats, 0.0, atol=1e-6), "Silent audio should give near-zero features"
+
+    def test_different_signals_differ(self):
+        """A sine and noise should have clearly different MRSTFT features."""
+        import torch.nn.functional as F
+        import torch
+        sine = _sine(440.0, 1.0)
+        noise = np.random.randn(SR).astype(np.float32) * 0.5
+        f_sine = self.mrstft(sine)
+        f_noise = self.mrstft(noise)
+        t = torch.tensor(f_sine).unsqueeze(0)
+        c = torch.tensor(f_noise).unsqueeze(0)
+        cos_sim = float(F.cosine_similarity(t, c))
+        assert cos_sim < 0.98, f"Sine and noise should be dissimilar (cos_sim={cos_sim:.4f})"
+
+    def test_static_signal_has_lower_std_than_transient(self):
+        """A long-held sine has lower temporal std than a sharp transient burst."""
+        static = _sine(440.0, 1.0)
+        transient = np.zeros(SR, dtype=np.float32)
+        transient[:2400] = np.random.randn(2400).astype(np.float32)  # 50ms burst then silence
+        f_static = self.mrstft(static)
+        f_transient = self.mrstft(transient)
+        n_first = 256 // 2 + 1
+        static_std_mean = float(f_static[n_first: 2 * n_first].mean())
+        transient_std_mean = float(f_transient[n_first: 2 * n_first].mean())
+        assert transient_std_mean > static_std_mean, \
+            f"Transient should have higher temporal std ({transient_std_mean:.4f} vs {static_std_mean:.4f})"
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Integration smoke test (no render; just imports and analysis)
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -380,6 +456,13 @@ class TestSmoke:
         assert hasattr(target_analysis, "analyze_target")
         assert hasattr(vst_hill_climb, "hill_climb")
         assert hasattr(vst_cmaes, "cmaes_refine")
+
+    def test_audio_compare_imports(self):
+        from s07_refine.audio_compare import (
+            compute_mrstft_features, compute_ap_features, score_audio_composite,
+            ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT,
+        )
+        assert abs(ENCODEC_WEIGHT + MRSTFT_WEIGHT + AP_WEIGHT - 1.0) < 1e-6
 
     def test_analyze_crane_scream_if_available(self):
         """Run full analysis on the actual target if it exists."""

@@ -85,6 +85,61 @@ def _detect_pitch_fft(audio, sr):
     return None
 
 
+def _detect_pitch_pyworld(
+    audio: np.ndarray,
+    sr: int,
+    hop_ms: float = 5.0,
+    f0_floor: float = 200.0,    # 200Hz minimum: crane scream range is 750-1110Hz
+    f0_ceil: float = 2000.0,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Extract continuous F0 pitch trajectory using WORLD vocoder (pyworld).
+
+    Returns (f0_hz, timestamps) arrays of shape (n_frames,) at hop_ms
+    resolution, or None if pyworld is not available.
+
+    pyworld advantages over autocorrelation / CREPE:
+    - Detects short bursts (single 5ms frames at 1018Hz at 85ms, 1012Hz at 135ms)
+    - Continuous voiced/unvoiced tracking — no confidence threshold needed
+    - F0 = 0 for unvoiced frames (no NaN management needed)
+    - Works at 48kHz natively — no resampling required
+    - Fast (deterministic, no GPU)
+    - Stonemask refinement significantly reduces octave errors
+
+    f0_floor should be set above the lowest harmonic you want to capture.
+    For bird calls in the 750-1110Hz range, 200Hz avoids sub-harmonic errors.
+    """
+    try:
+        import pyworld as pw
+    except ImportError:
+        return None
+
+    f0_raw, t = pw.dio(
+        audio.astype(np.float64), int(sr),
+        f0_floor=f0_floor, f0_ceil=f0_ceil,
+        frame_period=hop_ms,
+    )
+    f0 = pw.stonemask(audio.astype(np.float64), f0_raw, t, int(sr))
+    return f0.astype(np.float32), t.astype(np.float32)
+
+
+def _make_pitch_fn(
+    f0_hz: np.ndarray,
+    t_array: np.ndarray,
+) -> "Callable[[float], float | None]":
+    """Build a t_sec → hz lookup from a pyworld F0 array.
+
+    Returns None for unvoiced frames (F0 = 0).
+    Uses nearest-neighbour lookup on the time array.
+    """
+    def pitch_fn(t_sec: float) -> float | None:
+        idx = int(np.searchsorted(t_array, t_sec))
+        idx = max(0, min(len(f0_hz) - 1, idx))
+        hz = f0_hz[idx]
+        return None if hz <= 0 else float(hz)
+
+    return pitch_fn
+
+
 # ── Note region detection (energy + pitch-change aware) ──────────────────────
 
 def _hz_to_midi_note(hz, fallback=60):
@@ -113,10 +168,11 @@ def detect_note_regions(
     sr,
     profile_notes: list[int] | None = None,
     energy_threshold_factor: float = 0.05,
-    pitch_change_threshold_st: float = 3.0,
-    min_note_ms: float = 50.0,
+    pitch_change_threshold_st: float = 1.0,
+    min_note_ms: float = 20.0,
     analysis_win_ms: float = 20.0,
     analysis_hop_ms: float = 10.0,
+    pitch_fn=None,   # Optional: callable(t_sec) → hz or None (from CREPE)
 ):
     """Fine-grained note segmentation using energy + pitch discontinuity.
 
@@ -144,8 +200,9 @@ def detect_note_regions(
     for start in range(0, len(audio) - win_n + 1, hop_n):
         win = audio[start: start + win_n]
         rms = float(np.sqrt(np.mean(win ** 2)))
-        hz = detect_pitch_autocorr(win, sr)
-        frames.append({"t_sec": start / sr, "rms": rms, "hz": hz})
+        t_sec = start / sr
+        hz = pitch_fn(t_sec) if pitch_fn is not None else detect_pitch_autocorr(win, sr)
+        frames.append({"t_sec": t_sec, "rms": rms, "hz": hz})
 
     if not frames:
         return []
@@ -222,6 +279,176 @@ def _region_for_frame(t_sec, note_regions):
     return None
 
 
+def _write_pitch_bend_midi(
+    note_regions: list[dict],
+    fine_pitch_frames: list[dict],
+    output_path,
+    pb_range_st: float = 3.0,
+) -> float:
+    """Write a MIDI file with note-on/off events and fine pitch bend automation.
+
+    Pitch bend affects ALL oscillators simultaneously (unlike Osc 1 Pitch which
+    only moves Osc 1). Both Osc 1 and Osc 2 track the source pitch together.
+
+    Calibration (measured against OB-Xf):
+        Pitch Bend Up/Down param = 0.042 → ±2.06 semitones at full bend (±8192).
+        pb_range_param = 0.042 * (pb_range_st / 2.06)
+
+    Args:
+        note_regions: from detect_note_regions.
+        fine_pitch_frames: from _compute_fine_pitch_trajectory (pyworld at 5ms).
+        output_path: where to write the .mid file.
+        pb_range_st: total pitch bend range in semitones. ±3st covers the crane
+            scream's within-region drop from 1109Hz to ~950Hz (−2.66st).
+
+    Returns:
+        pb_range_param — the VST value to set for Pitch Bend Up and Pitch Bend Down.
+    """
+    try:
+        import mido
+    except ImportError:
+        return None
+
+    # Calibrated from OB-Xf measurement: 0.042 → 2.06 st at full ±8192 deflection.
+    PB_CALIB = 2.06 / 0.042       # semitones per param unit
+    pb_range_param = pb_range_st / PB_CALIB
+
+    ticks_per_beat = 960
+    tempo = 500000                 # 120 BPM
+
+    def sec_to_tick(t_sec: float) -> int:
+        return int(round(t_sec * ticks_per_beat * 1_000_000 / tempo))
+
+    # Build a flat event list, then sort by time for MIDI delta encoding
+    events: list[tuple] = []      # (time_sec, type, *args)
+
+    for i, r in enumerate(note_regions):
+        note_on_t = r["onset_sec"]
+        if i < len(note_regions) - 1:
+            note_off_t = note_regions[i + 1]["onset_sec"]
+        else:
+            note_off_t = r["offset_sec"]
+        dur = max(0.001, note_off_t - note_on_t)
+        events.append((note_on_t,  "note_on",  r["midi_note"], 100))
+        events.append((note_on_t + dur, "note_off", r["midi_note"], 0))
+
+    # Build a fast lookup: timestamp → base MIDI note frequency
+    note_hz_by_region: dict[tuple, float] = {}
+    for r in note_regions:
+        base_hz = 440.0 * (2 ** ((r["midi_note"] - 69) / 12.0))
+        note_hz_by_region[(r["onset_sec"], r["offset_sec"])] = base_hz
+
+    def base_hz_at(t: float) -> float | None:
+        for r in note_regions:
+            if r["onset_sec"] <= t <= r["offset_sec"]:
+                return 440.0 * (2 ** ((r["midi_note"] - 69) / 12.0))
+        return None
+
+    # Emit pitch bend for every frame that has a detected pitch (pyworld or
+    # autocorrelation fallback). Frames without pitch detection are simply
+    # skipped — the synth holds the last bend value automatically.
+    # No extrapolation needed since the hybrid tracker extends into the tail.
+    for frame in fine_pitch_frames:
+        t = frame["timestamp"]
+        pitch_hz = frame.get("pitch_hz")
+        if pitch_hz is None:
+            continue
+
+        base = base_hz_at(t)
+        if base is None:
+            continue
+
+        offset_st = 12.0 * np.log2(pitch_hz / base)
+        pb_value = int(offset_st / pb_range_st * 8192)
+        events.append((t, "pitchbend", max(-8192, min(8191, pb_value))))
+
+    events.sort(key=lambda e: e[0])
+
+    mid = mido.MidiFile(type=0, ticks_per_beat=ticks_per_beat)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+
+    current_tick = 0
+    for ev in events:
+        t_sec = ev[0]
+        tick = sec_to_tick(t_sec)
+        dt = max(0, tick - current_tick)
+        if ev[1] == "note_on":
+            track.append(mido.Message("note_on", channel=0, note=ev[2], velocity=ev[3], time=dt))
+            current_tick = tick
+        elif ev[1] == "note_off":
+            track.append(mido.Message("note_off", channel=0, note=ev[2], velocity=ev[3], time=dt))
+            current_tick = tick
+        elif ev[1] == "pitchbend":
+            track.append(mido.Message("pitchwheel", channel=0, pitch=ev[2], time=dt))
+            current_tick = tick
+
+    mid.save(str(output_path))
+    return pb_range_param
+
+
+def _compute_fine_pitch_trajectory(
+    audio: np.ndarray,
+    sr: int,
+    note_regions: list[dict],
+    win_ms: float = 20.0,
+    hop_ms: float = 10.0,
+    pitch_fn=None,   # Optional: precomputed CREPE pitch callable
+) -> list[dict]:
+    """High-resolution pitch tracking at hop_ms intervals.
+
+    Runs autocorrelation pitch detection at much finer resolution than the
+    surrogate inversion (which runs at 50ms hop). Returns per-frame pitch
+    and the corresponding Osc 1 Pitch automation value.
+
+    The returned osc1_pitch values are applied as VST automation in the render
+    to reproduce fine pitch glides (within-region bends, release drops, etc.)
+    that coarser tracking and fixed MIDI notes cannot capture.
+
+    Pitch range: OB-Xf Osc 1 Pitch is ±24 semitones (0.5=center). A glide
+    from 1109Hz to 950Hz on MIDI note 85 corresponds to:
+        offset = -2.66 semitones → osc1_pitch ≈ 0.5 - 2.66/48 ≈ 0.444
+    """
+    win_n = int(win_ms / 1000 * sr)
+    hop_n = int(hop_ms / 1000 * sr)
+    frames: list[dict] = []
+
+    for start in range(0, len(audio) - win_n + 1, hop_n):
+        t = (start + win_n // 2) / sr
+        r = _region_for_frame(t, note_regions)
+
+        # Primary: pyworld F0 (high accuracy for voiced portions)
+        if pitch_fn is not None:
+            pitch_hz = pitch_fn(t)
+        else:
+            pitch_hz = None
+
+        # Fallback: autocorrelation for unvoiced frames WITHIN a note region.
+        # pyworld loses tracking when the note amplitude fades, but autocorrelation
+        # still detects the pitch (e.g., 823Hz at t=0.58s in the crane scream tail).
+        # Only apply within regions to avoid tracking noise in silent gaps.
+        if pitch_hz is None and r is not None:
+            win = audio[start : start + win_n]
+            pitch_hz = detect_pitch_autocorr(win, sr)
+            # Reject sub-harmonic or harmonic overtone errors: the true pitch
+            # should stay within ±1 octave of the region's MIDI note.
+            if pitch_hz is not None:
+                expected_hz = 440.0 * (2 ** ((r["midi_note"] - 69) / 12.0))
+                if not (expected_hz * 0.50 < pitch_hz < expected_hz * 2.0):
+                    pitch_hz = None
+
+        base_note = r["midi_note"] if r else (note_regions[0]["midi_note"] if note_regions else 60)
+        osc1 = pitch_hz_to_osc1(pitch_hz, base_note) if pitch_hz else 0.5
+        frames.append({
+            "timestamp": float(t),
+            "pitch_hz": float(pitch_hz) if pitch_hz else None,
+            "osc1_pitch": float(osc1),
+        })
+
+    return frames
+
+
 # ── Pinned params ────────────────────────────────────────────────────────────
 # These params are pinned during surrogate inversion to prevent the surrogate
 # from finding degenerate solutions that produce the right embedding but the
@@ -263,7 +490,9 @@ def _pinned_indices(param_cols: list[str]) -> dict[int, float]:
 
 # ── Pitch → MIDI pitch bend + Osc 1 Pitch ────────────────────────────────────
 
-OSC1_PITCH_RANGE_SEMITONES = 12.0
+# OB-Xf Osc 1 Pitch is a ±24-semitone transpose: 0.0 = -24st, 0.5 = center, 1.0 = +24st.
+# (Confirmed: surrogate pushing to 1.0 shifts MIDI 85 / 1109Hz to ~4.4kHz = +24 semitones.)
+OSC1_PITCH_RANGE_SEMITONES = 24.0
 MIDI_PITCH_BEND_RANGE_SEMITONES = 2.0  # ±2 semitones via MIDI pitch bend
 
 
@@ -403,9 +632,16 @@ def stream_invert(
     hill_iterations: int = 2,
     hill_offsets: tuple[float, ...] = (-0.15, -0.05, 0.05, 0.15),
     run_cmaes: bool = False,
+    cmaes_mode: str = "hybrid",     # "global" | "per-region" | "hybrid"
     cmaes_popsize: int = 16,
     cmaes_maxiter: int = 20,
     cmaes_sigma0: float = 0.08,
+    # Fine pitch tracking — applied as Osc 1 Pitch automation in render
+    pitch_win_ms: float = 20.0,     # analysis window for fine pitch (ms)
+    pitch_hop_ms: float = 10.0,     # analysis hop for fine pitch (ms)
+    # Note detection sensitivity
+    min_note_ms: float = 20.0,      # minimum note duration for region detection
+    pitch_threshold_st: float = 1.0, # semitone jump triggering a new note region
 ) -> dict:
     # ── Mono enforcement ─────────────────────────────────────────────────────
     # All target files must be mono before analysis. See s07_refine/mono_utils.py.
@@ -436,13 +672,37 @@ def stream_invert(
 
     profile_notes = profile.get("probe", {}).get("notes", [])
 
-    # ── Fine-grained note region detection ───────────────────────────────
-    note_regions = detect_note_regions(audio, sr, profile_notes=profile_notes)
+    # ── pyworld F0 pitch extraction (full audio, deterministic) ──────────
+    # pyworld at 5ms resolution detects short bursts (single-frame voiced
+    # events at e.g. 85ms/135ms), continuous pitch glides, and voiced/unvoiced
+    # transitions without confidence thresholds or octave ambiguity.
+    # Falls back to per-frame autocorrelation if pyworld is unavailable.
+    pyworld_result = _detect_pitch_pyworld(audio, sr, hop_ms=pitch_hop_ms)
+    if pyworld_result is not None:
+        pw_f0, pw_t = pyworld_result
+        pitch_fn = _make_pitch_fn(pw_f0, pw_t)
+        n_voiced = int(np.sum(pw_f0 > 0))
+        print(f"pyworld F0: {len(pw_f0)} frames @ {pitch_hop_ms:.0f}ms, "
+              f"{n_voiced} voiced ({100*n_voiced//max(1,len(pw_f0))}%)")
+    else:
+        pitch_fn = None
+        print("pyworld not available — using autocorrelation pitch detection")
 
-    print(f"Detected {len(note_regions)} note region(s):")
+    # ── Fine-grained note region detection ───────────────────────────────
+    note_regions = detect_note_regions(
+        audio, sr,
+        profile_notes=profile_notes,
+        pitch_change_threshold_st=pitch_threshold_st,
+        min_note_ms=min_note_ms,
+        pitch_fn=pitch_fn,
+    )
+
+    print(f"Detected {len(note_regions)} note region(s) "
+          f"(threshold={pitch_threshold_st:.1f}st, min={min_note_ms:.0f}ms):")
     for i, r in enumerate(note_regions):
+        hz_str = f"{r['median_hz']:.0f}Hz" if r['median_hz'] else "?Hz"
         print(f"  Region {i}: {r['onset_sec']:.3f}s–{r['offset_sec']:.3f}s  "
-              f"pitch={r['median_hz']:.0f}Hz  MIDI={r['midi_note']}  "
+              f"pitch={hz_str}  MIDI={r['midi_note']}  "
               f"surrogate_note={r['surrogate_note']}")
 
     if not note_regions:
@@ -456,6 +716,19 @@ def stream_invert(
                          "surrogate_note": snapped}]
         print(f"  (fallback) {note_regions[0]}")
 
+    # ── Fine pitch tracking (high-resolution, applied to Osc 1 Pitch in render) ──
+    # Runs at pitch_hop_ms resolution (default 10ms) to capture sub-50ms pitch
+    # glides, bends, and burst transients that the 50ms surrogate analysis misses.
+    print(f"Computing fine pitch trajectory "
+          f"({pitch_win_ms:.0f}ms win / {pitch_hop_ms:.0f}ms hop"
+          f"{', pyworld' if pitch_fn is not None else ', autocorr'})...")
+    fine_pitch_frames = _compute_fine_pitch_trajectory(
+        audio, sr, note_regions, win_ms=pitch_win_ms, hop_ms=pitch_hop_ms,
+        pitch_fn=pitch_fn,
+    )
+    print(f"  → {len(fine_pitch_frames)} frames "
+          f"(vs {(len(audio)//int(hop_sec*sr)+1)} surrogate frames)")
+
     # ── Coarse frame analysis (embedding + per-frame pitch) ───────────────
     win_samples = int(win_sec * sr)
     hop_samples = int(hop_sec * sr)
@@ -465,8 +738,12 @@ def stream_invert(
     emb_list = []
 
     for start in tqdm(range(0, len(audio) - win_samples + 1, hop_samples), desc="Analyzing"):
+        t = (start + win_samples // 2) / sr
         window = audio[start: start + win_samples]
-        pitch_hz_list.append(detect_pitch_autocorr(window, sr))
+        if pitch_fn is not None:
+            pitch_hz_list.append(pitch_fn(t))
+        else:
+            pitch_hz_list.append(detect_pitch_autocorr(window, sr))
         emb_list.append(embedder.encodec_embed(window, sr, pool="mean"))
 
     # ── Per-frame region lookup & pitch trajectory ───────────────────────
@@ -554,6 +831,15 @@ def stream_invert(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     df.to_parquet(run_dir / "stream_params.parquet")
+
+    # Save fine pitch trajectory — loaded by _render_stream for Osc 1 Pitch automation.
+    with open(run_dir / "fine_pitch_trajectory.yaml", "w") as f:
+        yaml.dump({
+            "win_ms": pitch_win_ms,
+            "hop_ms": pitch_hop_ms,
+            "osc1_pitch_range_semitones": OSC1_PITCH_RANGE_SEMITONES,
+            "frames": fine_pitch_frames,
+        }, f, default_flow_style=False)
 
     best_patch = {
         "target": str(target_wav),
@@ -646,6 +932,7 @@ def stream_invert(
                 embedder=embedder,
                 device=device,
                 audio_duration=audio_duration,
+                mode=cmaes_mode,
                 sigma0=cmaes_sigma0,
                 popsize=cmaes_popsize,
                 maxiter=cmaes_maxiter,
@@ -688,22 +975,59 @@ def _render_stream(
 
     param_cols = [c for c in df.columns if c.startswith("p_")]
 
-    # Per-region note on/off.
-    # Note-off for region N is sent at the onset of region N+1 so the release
-    # phase starts at the correct transition point, not at the fine-grained
-    # energy-fade frame (which can be 20 ms before the next note-on, leaving
-    # insufficient time for even a short release to complete).
-    for i, r in enumerate(note_regions):
-        note_on = r["onset_sec"]
-        if i < len(note_regions) - 1:
-            note_off = note_regions[i + 1]["onset_sec"]
-        else:
-            note_off = r["offset_sec"]
-        note_dur = max(0.0, note_off - note_on)
-        if note_dur > 0:
-            plugin.add_midi_note(r["midi_note"], 100, note_on, note_dur)
+    # ── MIDI note events + pitch bend via MIDI file ───────────────────────
+    # If a fine pitch trajectory exists, generate a MIDI file containing
+    # both note-on/off events and fine pitch bend messages (5ms resolution).
+    # This gives true pitch bend affecting ALL oscillators simultaneously,
+    # unlike the Osc 1 Pitch VST automation which only moves Osc 1.
+    #
+    # Pitch bend range calibration (measured against OB-Xf):
+    #   Pitch Bend Up/Down = 0.042 → ±2.06 semitones at full bend (±8192 MIDI).
+    fine_traj_path = out_dir / "fine_pitch_trajectory.yaml"
+    midi_generated = False
 
-    # Parameter automation
+    if fine_traj_path.exists():
+        with open(fine_traj_path) as _fh:
+            fine_data = yaml.safe_load(_fh)
+        fine_frames = fine_data.get("frames", [])
+
+        if fine_frames:
+            midi_path = out_dir / "pitch_bend.mid"
+            pb_range_st = 6.0     # ±6 semitones: crane scream drops ~5st
+            pb_range_param = _write_pitch_bend_midi(
+                note_regions, fine_frames, midi_path, pb_range_st=pb_range_st,
+            )
+
+            if pb_range_param is not None:
+                # Set the VST pitch bend range before loading the MIDI file
+                if "Pitch Bend Up" in param_name_to_index:
+                    plugin.set_parameter(param_name_to_index["Pitch Bend Up"], pb_range_param)
+                if "Pitch Bend Down" in param_name_to_index:
+                    plugin.set_parameter(param_name_to_index["Pitch Bend Down"], pb_range_param)
+
+                plugin.clear_midi()
+                plugin.load_midi(str(midi_path))
+                midi_generated = True
+
+                voiced = sum(1 for f in fine_frames if f.get("pitch_hz"))
+                print(f"  MIDI pitch bend: {len(fine_frames)} frames, "
+                      f"{voiced} voiced, ±{pb_range_st:.1f}st range "
+                      f"(pb_param={pb_range_param:.3f})")
+
+    if not midi_generated:
+        # Fallback: add_midi_note without pitch bend
+        for i, r in enumerate(note_regions):
+            note_on = r["onset_sec"]
+            if i < len(note_regions) - 1:
+                note_off = note_regions[i + 1]["onset_sec"]
+            else:
+                note_off = r["offset_sec"]
+            note_dur = max(0.0, note_off - note_on)
+            if note_dur > 0:
+                plugin.add_midi_note(r["midi_note"], 100, note_on, note_dur)
+
+    # Parameter automation (timbre params — Osc 1 Pitch stays at 0.5 since
+    # pitch is now handled by MIDI pitch bend above)
     for col in param_cols:
         p_name = col.removeprefix("p_")
         if p_name in param_name_to_index:
@@ -711,15 +1035,11 @@ def _render_stream(
             data = np.column_stack((timestamps, df[col].values))
             plugin.set_automation(p_idx, data)
 
-    # Pitch bend (if exposed as a named VST parameter)
-    pitch_bends = [f["pitch_bend"] for f in pitch_traj["frames"]]
-    pb_timestamps = [f["timestamp"] for f in pitch_traj["frames"]]
-    if "Pitch Bend" in param_name_to_index:
-        pb_data = np.column_stack((pb_timestamps, pitch_bends))
-        plugin.set_automation(param_name_to_index["Pitch Bend"], pb_data)
-
     n_regions = len(note_regions)
-    notes_str = ", ".join(f"MIDI {r['midi_note']} ({r['median_hz']:.0f}Hz)" for r in note_regions)
+    notes_str = ", ".join(
+        f"MIDI {r['midi_note']} ({r['median_hz']:.0f}Hz)" if r['median_hz'] else f"MIDI {r['midi_note']}"
+        for r in note_regions
+    )
     print(f"Rendering stream: {total_sec:.2f}s  {n_regions} region(s): {notes_str}")
     engine.render(total_sec)
     audio_out = plugin.get_audio()
@@ -791,6 +1111,10 @@ def _refine_loop(
     target_emb = embedder.encodec_embed(target_audio, sr, pool="mean")
     target_emb_torch = torch.tensor(target_emb, dtype=torch.float32).to(device)
 
+    from s07_refine.audio_compare import compute_mrstft_features, compute_ap_features, score_audio_composite
+    target_mrstft = compute_mrstft_features(target_audio)
+    target_ap = compute_ap_features(target_audio, sr)
+
     def _render_and_score(current_df):
         engine = daw.RenderEngine(sr_profile, 512)
         plugin = engine.make_plugin_processor("synth", str(vst_path))
@@ -817,9 +1141,10 @@ def _refine_loop(
         if rendered.ndim == 2:
             rendered = rendered.mean(axis=1)
 
-        emb = embedder.encodec_embed(rendered, sr_profile, pool="mean")
-        emb_t = torch.tensor(emb, dtype=torch.float32).to(device)
-        score = (1.0 - F.cosine_similarity(emb_t.unsqueeze(0), target_emb_torch.unsqueeze(0))).item()
+        score = score_audio_composite(
+            rendered, sr_profile, target_emb_torch, embedder, device,
+            target_mrstft, target_ap,
+        )
         return score, rendered
 
     for iteration in range(max_iterations):
@@ -924,7 +1249,9 @@ def _refine_loop(
         print(f"\nRe-rendering best result (score={best_score:.4f})...")
         pitch_traj_refined = {
             "frames": [
-                {"timestamp": float(row["timestamp"]), "pitch_bend": float(row.get("pitch_bend", 0.5))}
+                {"timestamp": float(row["timestamp"]),
+                 "pitch_bend": float(row.get("pitch_bend", 0.5)),
+                 "osc1_pitch": float(row.get("osc1_pitch", 0.5))}
                 for _, row in best_df.iterrows()
             ]
         }
@@ -954,6 +1281,7 @@ def _hill_climb_step(
     them via `pinned_cols`).
     """
     from s07_refine.vst_hill_climb import hill_climb
+    from s07_refine.audio_compare import compute_mrstft_features, compute_ap_features
 
     target_audio, sr = sf.read(str(target_wav), dtype="float32")
     if target_audio.ndim == 2:
@@ -961,13 +1289,17 @@ def _hill_climb_step(
 
     target_emb = embedder.encodec_embed(target_audio, sr, pool="mean")
     target_emb_t = torch.tensor(target_emb, dtype=torch.float32, device=device)
+    target_mrstft = compute_mrstft_features(target_audio)
+    target_ap = compute_ap_features(target_audio, sr)
 
+    active = "EnCodec+MRSTFT" + ("+AP" if target_ap is not None else "")
     df = pd.read_parquet(run_dir / "stream_params.parquet")
     timestamps = df["timestamp"].values
     hop_sec = timestamps[1] - timestamps[0] if len(timestamps) > 1 else 0.05
     total_sec = audio_duration if audio_duration else timestamps[-1] + hop_sec
 
     print(f"\n=== Hill-climb refinement ({n_passes} pass(es), offsets={list(offsets)}) ===")
+    print(f"    Scoring: {active} composite (renormalised weights)")
 
     refined_df, final_score, change_log = hill_climb(
         df=df,
@@ -981,6 +1313,8 @@ def _hill_climb_step(
         device=device,
         offsets=offsets,
         n_passes=n_passes,
+        target_mrstft=target_mrstft,
+        target_ap=target_ap,
     )
 
     # Persist updated trajectory + best patch + change log.
@@ -1009,11 +1343,11 @@ def _hill_climb_step(
             f, default_flow_style=False,
         )
 
-    # Re-render with the refined params.
     pitch_traj = {
         "frames": [
             {"timestamp": float(row["timestamp"]),
-             "pitch_bend": float(row.get("pitch_bend", 0.5))}
+             "pitch_bend": float(row.get("pitch_bend", 0.5)),
+             "osc1_pitch": float(row.get("osc1_pitch", 0.5))}
             for _, row in refined_df.iterrows()
         ]
     }
@@ -1033,9 +1367,10 @@ def _cmaes_step(
     embedder,
     device: str,
     audio_duration: float,
-    sigma0: float,
-    popsize: int,
-    maxiter: int,
+    mode: str = "hybrid",
+    sigma0: float = 0.08,
+    popsize: int = 16,
+    maxiter: int = 20,
     audio: np.ndarray | None = None,
     sr: int = 48000,
 ):
@@ -1064,11 +1399,10 @@ def _cmaes_step(
 
     df = pd.read_parquet(run_dir / "stream_params.parquet")
 
-    # Build smart x0: blend analysis suggestions with current hill-climb result
+    # Apply target-analysis warm-start to the 15 surrogate params only.
+    # The 7 extra params are initialised inside cmaes_refine from profile reset values.
     current_x0 = np.array([float(df[c].median()) for c in param_cols])
     x0_smart = suggest_x0(analysis, param_cols, pinned_cols, current_x0)
-
-    # Apply smart x0 as starting point (write into df so CMA-ES uses it)
     for i, col in enumerate(param_cols):
         if col not in pinned_cols:
             df[col] = np.clip(df[col] + (x0_smart[i] - current_x0[i]) * 0.5, 0.0, 1.0)
@@ -1077,7 +1411,7 @@ def _cmaes_step(
     hop_sec = timestamps[1] - timestamps[0] if len(timestamps) > 1 else 0.05
     total_sec = audio_duration if audio_duration else timestamps[-1] + hop_sec
 
-    print(f"\n=== CMA-ES refinement (popsize={popsize}, maxiter={maxiter}) ===")
+    print(f"\n=== CMA-ES refinement (mode={mode}, popsize={popsize}, maxiter={maxiter}) ===")
 
     result = cmaes_refine(
         df=df,
@@ -1089,10 +1423,14 @@ def _cmaes_step(
         target_wav=target_wav,
         embedder=embedder,
         device=device,
+        mode=mode,
         sigma0=sigma0,
         popsize=popsize,
         maxiter=maxiter,
     )
+
+    # All param columns = surrogate 15 + extra 7 (now in result.best_df)
+    all_param_cols = [c for c in result.best_df.columns if c.startswith("p_")]
 
     # Persist
     result.best_df.to_parquet(run_dir / "stream_params.parquet")
@@ -1107,16 +1445,22 @@ def _cmaes_step(
         ],
         "pitch_hz": float(best_row["pitch_hz"]) if pd.notnull(best_row["pitch_hz"]) else None,
         "score": float(best_row["score"]),
-        "cmaes_score": float(result.best_score),
+        "cmaes_global_score": float(result.global_score),
+        "cmaes_region_scores": [float(s) for s in result.region_scores],
         "osc_config": result.osc_config,
-        "params": {col: float(best_row[col]) for col in param_cols},
+        "extra_params": result.extra_param_names,
+        "params": {col: float(best_row[col]) for col in all_param_cols
+                   if col in best_row.index},
     }
     with open(run_dir / "best_patch.yaml", "w") as f:
         yaml.dump(best_patch, f, default_flow_style=False)
 
     cmaes_log = {
-        "final_score": float(result.best_score),
+        "mode": result.mode,
+        "global_score": float(result.global_score),
+        "region_scores": [float(s) for s in result.region_scores],
         "osc_config": result.osc_config,
+        "extra_params_added": result.extra_param_names,
         "n_renders": result.n_renders,
         "restarts_used": result.restarts_used,
         "param_deltas": {k: float(v) for k, v in result.param_deltas.items()},
@@ -1125,15 +1469,16 @@ def _cmaes_step(
     with open(run_dir / "cmaes_log.yaml", "w") as f:
         yaml.dump(cmaes_log, f, default_flow_style=False)
 
-    # Re-render with best params
     pitch_traj = {
         "frames": [
             {"timestamp": float(row["timestamp"]),
-             "pitch_bend": float(row.get("pitch_bend", 0.5))}
+             "pitch_bend": float(row.get("pitch_bend", 0.5)),
+             "osc1_pitch": float(row.get("osc1_pitch", 0.5))}
             for _, row in result.best_df.iterrows()
         ]
     }
-    print(f"\nRe-rendering CMA-ES result (score={result.best_score:.4f}, "
+    print(f"\nRe-rendering CMA-ES result (global={result.global_score:.4f}, "
+          f"regions={[f'{s:.4f}' for s in result.region_scores]}, "
           f"config='{result.osc_config}')...")
     _render_stream(result.best_df, pitch_traj, profile_path, run_dir,
                    note_regions, audio_duration)
@@ -1163,10 +1508,23 @@ if __name__ == "__main__":
                     help="comma-separated list of per-param offsets to try each pass")
     ap.add_argument("--cmaes", action="store_true",
                     help="run s07 CMA-ES after hill-climb (requires: pip install cma)")
+    ap.add_argument("--cmaes-mode", default="hybrid",
+                    choices=["global", "per-region", "hybrid"],
+                    help="global=fast bypass (single patch, ~0.029); "
+                         "per-region=independent per note region; "
+                         "hybrid=global first then conditional per-region (default)")
     ap.add_argument("--cmaes-popsize", type=int, default=16)
     ap.add_argument("--cmaes-maxiter", type=int, default=20)
     ap.add_argument("--cmaes-sigma0", type=float, default=0.08,
                     help="CMA-ES step size (0.05=refine, 0.10-0.15=explore)")
+    ap.add_argument("--pitch-win-ms", type=float, default=20.0,
+                    help="Window size for fine pitch tracking (ms, default 20)")
+    ap.add_argument("--pitch-hop-ms", type=float, default=10.0,
+                    help="Hop size for fine pitch tracking (ms, default 10)")
+    ap.add_argument("--min-note-ms", type=float, default=20.0,
+                    help="Minimum note duration for region detection (ms, default 20)")
+    ap.add_argument("--pitch-threshold-st", type=float, default=1.0,
+                    help="Semitone jump triggering a new note region (default 1.0)")
 
     args = ap.parse_args()
 
@@ -1198,7 +1556,12 @@ if __name__ == "__main__":
         hill_iterations=args.hill_iterations,
         hill_offsets=hill_offsets,
         run_cmaes=args.cmaes,
+        cmaes_mode=args.cmaes_mode,
         cmaes_popsize=args.cmaes_popsize,
         cmaes_maxiter=args.cmaes_maxiter,
         cmaes_sigma0=args.cmaes_sigma0,
+        pitch_win_ms=args.pitch_win_ms,
+        pitch_hop_ms=args.pitch_hop_ms,
+        min_note_ms=args.min_note_ms,
+        pitch_threshold_st=args.pitch_threshold_st,
     )

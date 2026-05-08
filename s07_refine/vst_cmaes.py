@@ -1,53 +1,41 @@
-"""Strategy 2: CMA-ES on real VST renders with IPOP restart and osc-config search.
+"""Strategy 2: CMA-ES on real VST renders — three modes.
 
-Algorithm overview
-------------------
+Modes
+-----
+global (bypass)
+    Single CMA-ES run applying a global per-param offset to all frames.
+    The original working approach (achieved ~0.029 on crane scream).
+    Use this when you want speed or when per-region adds no benefit.
+    Fastest: ~120–320 renders.
 
-Outer loop — Oscillator configuration search (discrete)
-    OB-Xf oscillator waveform is not a continuous parameter; it is a set of
-    boolean toggles (Saw / Pulse for each oscillator). We try 3 candidate
-    configs and run a short CMA-ES pass on each to pick the best starting
-    config before committing to the full search.
+per-region
+    Independent CMA-ES per note region, each scored against that region's
+    own target embedding. Conceptually ideal for multi-note targets but
+    prone to step-function discontinuities and struggles on short regions
+    (< 400ms) where EnCodec embeddings are noisy.
+    Slowest: ~1000–3500 renders.
 
-    Configs tried:
-      "saw"       Osc 1 Saw=1, Osc 1 Pulse=0   (default; what the surrogate saw)
-      "pulse"     Osc 1 Saw=0, Osc 1 Pulse=1
-      "saw+pulse" Osc 1 Saw=1, Osc 1 Pulse=1   (both; richer)
+hybrid (default)
+    Global CMA-ES first (fast, robust, gets to ~0.029).  Then, for each
+    region whose duration >= min_region_sec, run a short per-region
+    fine-tune pass seeded from the global result.  Only accept the
+    per-region result when it beats the global score by more than
+    `per_region_improvement` (5% by default).  Apply linear crossfade
+    at region boundaries to avoid abrupt timbral jumps.
+    Recommended: combines global robustness with per-region richness.
 
-    Short scouting pass: popsize=8, maxiter=5 per config → 120 renders ≈ 4 min.
-    Full pass uses the winning config.
+Expanded parameter space (22 total)
+    15 surrogate params (from s06b) + 7 from `cmaes_extra_params` in
+    the profile: Filter Env Attack/Decay/Sustain/Release, Osc 2 Volume,
+    Amp Env Sustain, Unison Detune.  These 7 are the primary source of
+    timbral richness in subtractive synthesis and were frozen at reset
+    values in all previous stages.
 
-Inner loop — CMA-ES with IPOP restart
-    Standard CMA-ES with hard parameter bounds [0,1]. Pinned params are fixed
-    in the objective by forcing them back every evaluation.
-
-    IPOP restart (Auger & Hansen 2005): if the CMA-ES stagnates (best score
-    does not improve by > STAGNATION_THRESHOLD over an iteration), restart with
-    1.5× population. This escapes local optima without committing to a full
-    re-initialisation. Maximum RESTART_LIMIT restarts.
-
-Composite scoring
-    Primary: EnCodec cosine distance (128-d pre-quantiser latents).
-    Secondary: MRSTFT distance (if available; weighted 0.3). MRSTFT captures
-    fine spectral detail (filter resonance peaks, formant sharpness) that
-    EnCodec's 150 Hz frame rate can miss.
-
-    score = encodec_cosine_dist + 0.3 * mrstft_dist_norm
-
-    If the `s04_embed.embed.Embedder.mrstft_feats` method is unavailable
-    (e.g. running without that module), falls back to EnCodec only.
-
-Research references
--------------------
-* Auger & Hansen (2005) "A Restart CMA Evolution Strategy With Increasing
-  Population Size" (IPOP-CMA-ES) — the canonical restart strategy used here.
-* Hansen (2016) "The CMA Evolution Strategy: A Tutorial" — parameter tuning
-  guidelines: sigma0 ≈ 0.3 * initial_search_range for global search,
-  sigma0 ≈ 0.05 for refinement near a known-good solution.
-* Yee-King (2011) — oscillator waveform selection via spectral matching
-  outperforms fixing the waveform to a single type.
-* Reniery et al. (2023) "Neural Synthesizer Matching" — composite objectives
-  (spectral + temporal) improve patch search quality vs single-metric search.
+Research
+--------
+Hansen (2016) "CMA-ES Tutorial" — sigma guidelines; IPOP restart details.
+Yee-King (2011) — osc config scouting outperforms single-waveform assumption.
+Reniery et al. (2023) — hybrid global+local search beats pure global.
 """
 from __future__ import annotations
 
@@ -67,23 +55,29 @@ import soundfile as sf
 import torch
 import yaml
 
-from s07_refine.audio_compare import render_trajectory, score_audio
+from s07_refine.audio_compare import (
+    render_trajectory,
+    render_region,
+    render_region_and_score,
+    score_audio,
+    score_audio_composite,
+    compute_mrstft_features,
+    compute_ap_features,
+)
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Oscillator configurations: name → {param_name: value} overrides.
-# These are applied via `extra_params` in render_trajectory() on top of the
-# profile's reset values.
 OSC_CONFIGS: dict[str, dict[str, float]] = {
     "saw":       {"Osc 1 Saw Wave": 1.0, "Osc 1 Pulse Wave": 0.0},
     "pulse":     {"Osc 1 Saw Wave": 0.0, "Osc 1 Pulse Wave": 1.0},
     "saw+pulse": {"Osc 1 Saw Wave": 1.0, "Osc 1 Pulse Wave": 1.0},
 }
 
-STAGNATION_THRESHOLD = 0.002   # minimum improvement per iteration to not stagnate
-RESTART_LIMIT = 2              # maximum IPOP restarts after the main run
-MRSTFT_WEIGHT = 0.3            # weight for secondary MRSTFT score
+STAGNATION_THRESHOLD = 0.002
+RESTART_LIMIT = 2
+SCOUT_MAXITER = 5
+SCOUT_POPSIZE = 8
 
 
 # ── Result dataclass ─────────────────────────────────────────────────────────
@@ -91,12 +85,51 @@ MRSTFT_WEIGHT = 0.3            # weight for secondary MRSTFT score
 @dataclass
 class CMAESResult:
     best_df: pd.DataFrame
-    best_score: float
+    global_score: float
+    region_scores: list[float]       # per-region scores (empty for global mode)
     osc_config: str
+    mode: str                        # which mode was used
     n_renders: int
     restarts_used: int
-    param_deltas: dict[str, float]   # param_col → total offset from x0
+    param_deltas: dict[str, float]
+    extra_param_names: list[str]
     iteration_log: list[dict] = field(default_factory=list)
+
+
+# ── Profile helpers ──────────────────────────────────────────────────────────
+
+def load_extra_params(profile_path: _Path) -> dict[str, dict]:
+    """Return {param_name: {reset, lo, hi}} for cmaes_extra_params in profile.
+
+    The `bounds` key in each entry is optional; defaults to [0.0, 1.0].
+    The `reset` value is the initial CMA-ES starting point for that param.
+    """
+    with open(profile_path) as f:
+        profile = yaml.safe_load(f)
+    extras = profile.get("cmaes_extra_params", {})
+    reset = profile.get("reset", {})
+    result: dict[str, dict] = {}
+    for name, cfg in extras.items():
+        cfg = cfg or {}
+        bounds = cfg.get("bounds", [0.0, 1.0])
+        lo, hi = float(bounds[0]), float(bounds[1])
+        init = float(reset.get(name, 0.5))
+        # Clamp reset to the allowed bounds
+        init = float(np.clip(init, lo, hi))
+        result[name] = {"reset": init, "lo": lo, "hi": hi}
+    return result
+
+
+def _extend_df(df: pd.DataFrame, extra_params: dict[str, dict]) -> tuple[pd.DataFrame, list[str]]:
+    """Add extra param columns (constant at reset value). Returns (df, extra_cols)."""
+    df = df.copy()
+    extra_cols: list[str] = []
+    for name, cfg in extra_params.items():
+        col = f"p_{name}"
+        if col not in df.columns:
+            df[col] = float(cfg["reset"])
+        extra_cols.append(col)
+    return df, extra_cols
 
 
 # ── Main entry point ─────────────────────────────────────────────────────────
@@ -111,352 +144,689 @@ def cmaes_refine(
     target_wav: _Path,
     embedder,
     device: str,
-    sigma0: float = 0.08,
+    # Mode
+    mode: str = "hybrid",           # "global" | "per-region" | "hybrid"
+    # CMA-ES tuning
+    sigma0: float = 0.10,
     popsize: int = 16,
     maxiter: int = 20,
-    scout_maxiter: int = 5,
-    scout_popsize: int = 8,
-    osc_configs: Iterable[str] = ("saw", "pulse", "saw+pulse"),
+    # Per-region / hybrid settings
+    min_region_sec: float = 0.40,   # regions shorter than this skip per-region pass
+    per_region_improvement: float = 0.05,  # min relative improvement to accept per-region
+    crossfade_sec: float = 0.05,    # linear blend window at region boundaries
     verbose: bool = True,
 ) -> CMAESResult:
-    """Run CMA-ES with IPOP restart and oscillator config scouting.
+    """CMA-ES refinement with selectable mode.
 
     Args:
-        df: per-frame param trajectory (from hill-climb output).
-        note_regions: s06b region dicts.
-        param_cols: ordered `p_<name>` param columns.
-        pinned_cols: params that must not change (see PINNED_PARAMS in
-            stream_invert.py).
-        profile_path: synth profile YAML.
-        total_sec: render duration.
-        target_wav: path to mono target WAV (for scoring).
-        embedder: Embedder instance.
-        device: torch device string.
-        sigma0: initial CMA-ES step size. Use 0.05 for refinement near a
-            known-good result; 0.10–0.15 for a wider exploration.
-        popsize: CMA-ES population size (main run).
-        maxiter: maximum CMA-ES iterations (main run).
-        scout_maxiter: iterations for the oscillator config scouting pass.
-        scout_popsize: population for the scouting pass.
-        osc_configs: oscillator config names to scout (subset of OSC_CONFIGS).
-        verbose: print progress.
-
-    Returns:
-        CMAESResult with best_df, best_score, diagnostics.
+        mode:
+            "global"     — single global CMA-ES pass (fastest, robust ~0.029).
+            "per-region" — independent per-region CMA-ES (experimental).
+            "hybrid"     — global first, then per-region fine-tune where
+                           beneficial. Default and recommended.
+        min_region_sec: regions shorter than this (ms) skip the per-region
+            pass in hybrid mode (EnCodec embeddings are unreliable on very
+            short clips).
+        per_region_improvement: in hybrid mode, per-region result is only
+            accepted when it beats the global score by this fraction.
+        crossfade_sec: in per-region / hybrid mode, params are linearly
+            interpolated over this window at each region boundary to avoid
+            abrupt timbral steps.
     """
     try:
         import cma
     except ImportError:
         raise ImportError(
-            "cma package required for CMA-ES: pip install cma\n"
-            "Install inside the conda env: conda run -n mimic-synth pip install cma"
+            "cma package required: conda run -n mimic-synth pip install cma"
         )
 
     pinned_cols = set(pinned_cols)
-    free_cols = [c for c in param_cols if c not in pinned_cols]
-    free_indices = [param_cols.index(c) for c in free_cols]
 
-    # Load and embed target once.
+    # ── Extend to expanded param space ───────────────────────────────────────
+    extra_param_meta = load_extra_params(profile_path)
+    df, extra_cols = _extend_df(df, extra_param_meta)
+    all_param_cols = param_cols + [c for c in extra_cols if c not in param_cols]
+    extra_col_names = [c[2:] for c in extra_cols]
+
+    # Build per-param bounds array (shape [n_free, 2]).  Surrogate params use
+    # [0, 1]; extra params use their profile-defined bounds.
+    extra_bounds: dict[str, tuple[float, float]] = {
+        f"p_{name}": (cfg["lo"], cfg["hi"])
+        for name, cfg in extra_param_meta.items()
+    }
+
+    if verbose:
+        print(f"  Mode: {mode}  |  {len(param_cols)} surrogate + "
+              f"{len(extra_cols)} extra = {len(all_param_cols)} total params")
+
+    # ── Load and embed target ─────────────────────────────────────────────────
     target_audio, sr_t = sf.read(str(target_wav), dtype="float32")
     if target_audio.ndim == 2:
         target_audio = target_audio.mean(axis=1)
-    target_emb_t = torch.tensor(
+    full_target_emb_t = torch.tensor(
         embedder.encodec_embed(target_audio, sr_t, pool="mean"),
-        dtype=torch.float32, device=device
+        dtype=torch.float32, device=device,
     )
+    full_target_mrstft = compute_mrstft_features(target_audio)
+    full_target_ap = compute_ap_features(target_audio, int(sr_t))  # None if pyworld absent
 
-    # Extract initial x0 from the dataframe (median across frames for stability)
-    x0_full = np.array([float(df[c].median()) for c in param_cols])
-
-    # ── Stage 1: Oscillator config scouting ──────────────────────────────────
-
-    best_osc_config, x0_full, scout_n_renders = _scout_osc_configs(
-        x0_full=x0_full,
-        df=df,
-        note_regions=note_regions,
-        param_cols=param_cols,
-        free_cols=free_cols,
-        free_indices=free_indices,
-        pinned_cols=pinned_cols,
-        profile_path=profile_path,
-        total_sec=total_sec,
-        target_emb_t=target_emb_t,
-        embedder=embedder,
-        device=device,
-        osc_configs=list(osc_configs),
-        sigma0=sigma0 * 1.5,
-        popsize=scout_popsize,
-        maxiter=scout_maxiter,
-        verbose=verbose,
-        cma=cma,
-    )
-
-    extra_params = OSC_CONFIGS[best_osc_config]
+    active = "EnCodec+MRSTFT" + ("+AP" if full_target_ap is not None else "")
     if verbose:
-        print(f"\n  Selected oscillator config: {best_osc_config} ({extra_params})")
+        print(f"  Scoring: {active} composite distance (renormalised weights)")
 
-    # ── Stage 2: Full CMA-ES with IPOP on winning config ─────────────────────
+    # ── Osc config scouting (once, regardless of mode) ───────────────────────
+    best_osc_config, scout_renders = _scout_osc_configs(
+        df=df, all_param_cols=all_param_cols, pinned_cols=pinned_cols,
+        note_regions=note_regions, profile_path=profile_path, total_sec=total_sec,
+        target_emb_t=full_target_emb_t, target_mrstft=full_target_mrstft,
+        target_ap=full_target_ap, embedder=embedder, device=device,
+        sigma0=sigma0 * 1.5, extra_bounds=extra_bounds, verbose=verbose, cma=cma,
+    )
+    extra_osc = OSC_CONFIGS[best_osc_config]
+    if verbose:
+        print(f"\n  Selected oscillator config: {best_osc_config}")
 
-    x0_free = x0_full[free_indices]
-
-    best_x_full = x0_full.copy()
-    best_score = _score_x(
-        x0_free, x0_full, free_indices, pinned_cols, param_cols,
-        df, note_regions, profile_path, total_sec,
-        target_emb_t, embedder, device, extra_params,
+    # ── Dispatch to mode ──────────────────────────────────────────────────────
+    shared = dict(
+        df=df, all_param_cols=all_param_cols, pinned_cols=pinned_cols,
+        note_regions=note_regions, profile_path=profile_path, total_sec=total_sec,
+        target_emb_t=full_target_emb_t, target_mrstft=full_target_mrstft,
+        target_ap=full_target_ap,
+        embedder=embedder, device=device,
+        extra_osc=extra_osc, sigma0=sigma0, popsize=popsize, maxiter=maxiter,
+        extra_bounds=extra_bounds, verbose=verbose, cma=cma,
     )
 
-    iteration_log: list[dict] = []
-    n_renders = scout_n_renders
-    restarts_used = 0
-    current_sigma = sigma0
-    current_popsize = popsize
+    if mode == "global":
+        result_df, global_score, n_renders, restarts, log = _run_global(**shared)
+        region_scores: list[float] = []
 
-    for restart in range(RESTART_LIMIT + 1):
-        if verbose and restart > 0:
-            print(f"\n  IPOP restart {restart}/{RESTART_LIMIT} "
-                  f"(sigma={current_sigma:.3f}, popsize={current_popsize})")
-
-        result_x, result_score, renders_this_run, run_log = _run_cmaes(
-            x0_free=x0_full[free_indices].copy(),
-            x0_full=x0_full,
-            free_indices=free_indices,
-            pinned_cols=pinned_cols,
-            param_cols=param_cols,
-            df=df,
-            note_regions=note_regions,
-            profile_path=profile_path,
-            total_sec=total_sec,
-            target_emb_t=target_emb_t,
-            embedder=embedder,
-            device=device,
-            extra_params=extra_params,
-            sigma0=current_sigma,
-            popsize=current_popsize,
-            maxiter=maxiter,
-            verbose=verbose,
-            cma=cma,
+    elif mode == "per-region":
+        region_embs = _compute_region_embs(target_audio, sr_t, note_regions, embedder, device, full_target_emb_t)
+        region_mrstfts = _compute_region_mrstfts(target_audio, sr_t, note_regions, full_target_mrstft)
+        region_aps = _compute_region_aps(target_audio, int(sr_t), note_regions, full_target_ap)
+        result_df, region_scores, global_score, n_renders, restarts, log = _run_per_region(
+            **shared, region_embs=region_embs, region_mrstfts=region_mrstfts,
+            region_aps=region_aps, crossfade_sec=crossfade_sec, sr=sr_t,
         )
 
-        n_renders += renders_this_run
-        iteration_log.extend(run_log)
+    else:  # hybrid
+        region_embs = _compute_region_embs(target_audio, sr_t, note_regions, embedder, device, full_target_emb_t)
+        region_mrstfts = _compute_region_mrstfts(target_audio, sr_t, note_regions, full_target_mrstft)
+        region_aps = _compute_region_aps(target_audio, int(sr_t), note_regions, full_target_ap)
+        result_df, region_scores, global_score, n_renders, restarts, log = _run_hybrid(
+            **shared, region_embs=region_embs, region_mrstfts=region_mrstfts,
+            region_aps=region_aps, min_region_sec=min_region_sec,
+            per_region_improvement=per_region_improvement,
+            crossfade_sec=crossfade_sec, sr=sr_t,
+        )
 
-        if result_score < best_score:
-            best_score = result_score
-            best_x_full = x0_full.copy()
-            best_x_full[free_indices] = result_x
-            x0_full = best_x_full.copy()   # seed next restart from best
-            if verbose:
-                print(f"  ✓ Improved to {best_score:.4f}")
+    total_renders = scout_renders + n_renders
 
-        improvement = best_score - result_score if restart == 0 else 0
-        if best_score < 0.06:
-            if verbose:
-                print(f"  Score {best_score:.4f} below target 0.06 — stopping.")
-            break
-        if restarts_used >= RESTART_LIMIT:
-            break
-
-        # IPOP: 1.5× population on restart
-        restarts_used += 1
-        current_popsize = int(current_popsize * 1.5)
-        current_sigma = max(current_sigma * 0.8, 0.03)   # tighten search radius
-
-    # ── Build result ──────────────────────────────────────────────────────────
-
-    # Apply best params to a copy of the df (all frames get the same offsets;
-    # this matches the hill-climb approach of global per-param shifts).
-    result_df = df.copy()
+    # ── Param deltas ──────────────────────────────────────────────────────────
     param_deltas: dict[str, float] = {}
-    for i, col in enumerate(param_cols):
+    for col in all_param_cols:
         if col in pinned_cols:
             continue
-        old_val = float(df[col].median())
-        new_val = float(np.clip(best_x_full[i], 0.0, 1.0))
-        delta = new_val - old_val
-        if abs(delta) > 0.001:
-            result_df[col] = np.clip(result_df[col] + delta, 0.0, 1.0)
-            param_deltas[col] = delta
+        old = float(df[col].median()) if col in df.columns else 0.5
+        new = float(result_df[col].median()) if col in result_df.columns else old
+        if abs(new - old) > 0.005:
+            param_deltas[col] = new - old
 
     if verbose:
-        print(f"\n  CMA-ES done: score {best_score:.4f}  "
-              f"({n_renders} renders, {restarts_used} restart(s))")
+        print(f"\n  CMA-ES done ({mode} mode):")
+        if region_scores:
+            print(f"    Region scores: {[f'{s:.4f}' for s in region_scores]}")
+        print(f"    Global score:  {global_score:.4f}")
+        print(f"    Total renders: {total_renders}  restarts: {restarts}")
         print(f"  Params moved ({len(param_deltas)}):")
-        for col, delta in sorted(param_deltas.items(), key=lambda x: -abs(x[1])):
-            print(f"    {col[2:]:30s}  Δ={delta:+.3f}")
+        for col, d in sorted(param_deltas.items(), key=lambda x: -abs(x[1])):
+            tag = " ★" if col[2:] in extra_col_names else ""
+            print(f"    {col[2:]:35s} Δ={d:+.3f}{tag}")
+        if extra_col_names:
+            print(f"  (★ = new extra param)")
 
     return CMAESResult(
         best_df=result_df,
-        best_score=best_score,
+        global_score=global_score,
+        region_scores=region_scores,
         osc_config=best_osc_config,
-        n_renders=n_renders,
-        restarts_used=restarts_used,
+        mode=mode,
+        n_renders=total_renders,
+        restarts_used=restarts,
         param_deltas=param_deltas,
-        iteration_log=iteration_log,
+        extra_param_names=extra_col_names,
+        iteration_log=log,
     )
 
 
-# ── Oscillator config scouting ───────────────────────────────────────────────
+# ── Mode 1: Global ────────────────────────────────────────────────────────────
 
-def _scout_osc_configs(
-    x0_full, df, note_regions, param_cols, free_cols, free_indices,
-    pinned_cols, profile_path, total_sec, target_emb_t, embedder, device,
-    osc_configs, sigma0, popsize, maxiter, verbose, cma,
-) -> tuple[str, np.ndarray, int]:
-    """Run a short CMA-ES pass on each oscillator config; return the best."""
-    best_config = osc_configs[0]
-    best_score = float("inf")
-    best_x = x0_full.copy()
+def _make_bounds(free_cols: list[str], extra_bounds: dict[str, tuple[float, float]]):
+    """Return (lo_list, hi_list) for the free param columns."""
+    lo = [extra_bounds.get(c, (0.0, 1.0))[0] for c in free_cols]
+    hi = [extra_bounds.get(c, (0.0, 1.0))[1] for c in free_cols]
+    return lo, hi
+
+
+def _run_global(
+    df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
+    target_emb_t, target_mrstft, target_ap, embedder, device, extra_osc,
+    sigma0, popsize, maxiter, extra_bounds, verbose, cma,
+) -> tuple[pd.DataFrame, float, int, int, list]:
+    """Single CMA-ES over global per-param offsets. The clean bypass path."""
+    free_cols = [c for c in all_param_cols if c not in pinned_cols]
+    x0_median = {c: float(df[c].median()) if c in df.columns else 0.5
+                 for c in all_param_cols}
+    lo, hi = _make_bounds(free_cols, extra_bounds)
+    x0_free = np.clip([x0_median[c] for c in free_cols], lo, hi).astype(np.float64)
+
+    best_x, best_score, n_renders, restarts, log = _ipop_cmaes(
+        objective=lambda x: _score_global(
+            x, free_cols, pinned_cols, x0_median, df, all_param_cols,
+            note_regions, profile_path, total_sec, target_emb_t, embedder, device,
+            extra_osc, target_mrstft, target_ap,
+        ),
+        x0=x0_free, n_dims=len(x0_free), bounds=(lo, hi),
+        sigma0=sigma0, popsize=popsize, maxiter=maxiter,
+        score_target=0.04, verbose=verbose, verbose_prefix="  ", cma=cma,
+    )
+
+    result_df = _apply_global_offsets(df, best_x, free_cols, x0_median, all_param_cols, pinned_cols)
+
+    audio, sr = render_trajectory(result_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
+    global_score = score_audio_composite(audio, sr, target_emb_t, embedder, device, target_mrstft, target_ap)
+    n_renders += 1
+
+    return result_df, global_score, n_renders, restarts, log
+
+
+# ── Mode 2: Per-region ────────────────────────────────────────────────────────
+
+def _run_per_region(
+    df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
+    target_emb_t, target_mrstft, target_ap, region_embs, region_mrstfts, region_aps,
+    embedder, device, extra_osc, sigma0, popsize, maxiter, extra_bounds,
+    crossfade_sec, sr, verbose, cma,
+) -> tuple[pd.DataFrame, list[float], float, int, int, list]:
+    """Independent CMA-ES per region, stitched with crossfade."""
+    free_cols = [c for c in all_param_cols if c not in pinned_cols]
+    x0_median = {c: float(df[c].median()) if c in df.columns else 0.5
+                 for c in all_param_cols}
+
+    region_best_params: list[dict[str, float]] = []
+    region_scores: list[float] = []
     total_renders = 0
+    total_restarts = 0
+    all_logs: list[dict] = []
+
+    for reg_idx, region in enumerate(note_regions):
+        reg_dur = max(0.05, region["offset_sec"] - region["onset_sec"])
+        reg_note = region["midi_note"]
+        if verbose:
+            print(f"\n  Region {reg_idx}: {region['onset_sec']:.2f}–"
+                  f"{region['offset_sec']:.2f}s  MIDI={reg_note}  ({reg_dur:.2f}s)")
+
+        mask = ((df["timestamp"] >= region["onset_sec"]) &
+                (df["timestamp"] <= region["offset_sec"]))
+        region_df = df[mask] if mask.sum() > 0 else df
+        x0_reg = {c: float(region_df[c].median()) if c in region_df.columns else x0_median.get(c, 0.5)
+                  for c in all_param_cols}
+        lo_r, hi_r = _make_bounds(free_cols, extra_bounds)
+        x0_free = np.clip([x0_reg.get(c, 0.5) for c in free_cols], lo_r, hi_r).astype(np.float64)
+        best_x, best_score, n, restarts, log = _ipop_cmaes(
+            objective=lambda x, _note=reg_note, _dur=reg_dur, \
+                    _emb=region_embs[reg_idx], _mrstft=region_mrstfts[reg_idx], \
+                    _ap=region_aps[reg_idx]: \
+                _score_region(x, free_cols, pinned_cols, x0_reg,
+                              _note, _dur, profile_path, _emb, embedder, device,
+                              extra_osc, _mrstft, _ap),
+            x0=x0_free, n_dims=len(x0_free), bounds=(lo_r, hi_r),
+            sigma0=sigma0, popsize=popsize, maxiter=maxiter,
+            score_target=0.03, verbose=verbose, verbose_prefix="    ", cma=cma,
+        )
+        total_renders += n
+        total_restarts += restarts
+        for e in log: e["region"] = reg_idx
+        all_logs.extend(log)
+
+        best_params = x0_reg.copy()
+        for i, col in enumerate(free_cols):
+            best_params[col] = float(np.clip(best_x[i], 0.0, 1.0))
+        region_best_params.append(best_params)
+        region_scores.append(best_score)
+        if verbose:
+            print(f"    Region {reg_idx} final: {best_score:.4f}")
+
+    result_df = _stitch_with_crossfade(df, note_regions, region_best_params, all_param_cols, crossfade_sec, sr)
+
+    audio, sr_r = render_trajectory(result_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
+    global_score = score_audio_composite(audio, sr_r, target_emb_t, embedder, device, target_mrstft, target_ap)
+    total_renders += 1
+
+    return result_df, region_scores, global_score, total_renders, total_restarts, all_logs
+
+
+# ── Mode 3: Hybrid ────────────────────────────────────────────────────────────
+
+def _run_hybrid(
+    df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
+    target_emb_t, target_mrstft, target_ap, region_embs, region_mrstfts, region_aps,
+    embedder, device, extra_osc, sigma0, popsize, maxiter, extra_bounds,
+    min_region_sec, per_region_improvement, crossfade_sec, sr, verbose, cma,
+) -> tuple[pd.DataFrame, list[float], float, int, int, list]:
+    """Global first, then per-region fine-tune where beneficial."""
+    if verbose:
+        print("\n  Phase 1: Global CMA-ES")
+
+    result_df, global_score, n1, restarts1, log1 = _run_global(
+        df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
+        target_emb_t, target_mrstft, target_ap, embedder, device, extra_osc,
+        sigma0=sigma0, popsize=popsize, maxiter=maxiter,
+        extra_bounds=extra_bounds, verbose=verbose, cma=cma,
+    )
+    if verbose:
+        print(f"  Phase 1 done: global score = {global_score:.4f}")
+
+    free_cols = [c for c in all_param_cols if c not in pinned_cols]
+    region_scores: list[float] = []
+    n2 = 0
+    restarts2 = 0
+    log2: list[dict] = []
+    per_region_params = []
 
     if verbose:
-        print(f"\n=== Oscillator config scouting ({len(osc_configs)} configs) ===")
+        print(f"\n  Phase 2: Per-region fine-tune "
+              f"(min_region={min_region_sec:.2f}s, "
+              f"min_improvement={per_region_improvement*100:.0f}%)")
 
-    for config_name in osc_configs:
-        extra = OSC_CONFIGS.get(config_name, {})
-        if verbose:
-            print(f"  Scouting '{config_name}' ({extra}) ...")
+    for reg_idx, region in enumerate(note_regions):
+        reg_dur = max(0.0, region["offset_sec"] - region["onset_sec"])
+        reg_note = region["midi_note"]
 
-        result_x, result_score, n_renders, _ = _run_cmaes(
-            x0_free=x0_full[free_indices].copy(),
-            x0_full=x0_full,
-            free_indices=free_indices,
-            pinned_cols=pinned_cols,
-            param_cols=param_cols,
-            df=df,
-            note_regions=note_regions,
-            profile_path=profile_path,
-            total_sec=total_sec,
-            target_emb_t=target_emb_t,
-            embedder=embedder,
-            device=device,
-            extra_params=extra,
-            sigma0=sigma0,
-            popsize=popsize,
-            maxiter=maxiter,
-            verbose=False,
-            cma=cma,
+        if reg_dur < min_region_sec:
+            if verbose:
+                print(f"  Region {reg_idx}: {reg_dur:.2f}s < {min_region_sec:.2f}s — skipped")
+            per_region_params.append(None)
+            region_scores.append(float("nan"))
+            continue
+
+        mask = ((result_df["timestamp"] >= region["onset_sec"]) &
+                (result_df["timestamp"] <= region["offset_sec"]))
+        region_df = result_df[mask] if mask.sum() > 0 else result_df
+        x0_reg = {c: float(region_df[c].median()) if c in region_df.columns else 0.5
+                  for c in all_param_cols}
+
+        global_params_named = {c[2:]: x0_reg.get(c, 0.5) for c in all_param_cols}
+        baseline_region_score = render_region_and_score(
+            global_params_named, reg_note, reg_dur, profile_path,
+            region_embs[reg_idx], embedder, device, extra_osc,
+            target_mrstft=region_mrstfts[reg_idx],
+            target_ap=region_aps[reg_idx],
         )
-        total_renders += n_renders
+        n2 += 1
+
         if verbose:
-            print(f"    → score {result_score:.4f}  ({n_renders} renders)")
+            print(f"\n  Region {reg_idx}: {region['onset_sec']:.2f}–"
+                  f"{region['offset_sec']:.2f}s  MIDI={reg_note}  "
+                  f"({reg_dur:.2f}s)  baseline={baseline_region_score:.4f}")
 
-        if result_score < best_score:
-            best_score = result_score
-            best_config = config_name
-            best_x = x0_full.copy()
-            best_x[free_indices] = result_x
+        threshold = baseline_region_score * (1.0 - per_region_improvement)
+        lo_r, hi_r = _make_bounds(free_cols, extra_bounds)
+        x0_free = np.clip([x0_reg.get(c, 0.5) for c in free_cols], lo_r, hi_r).astype(np.float64)
 
-    return best_config, best_x, total_renders
+        best_x, best_score, n, restarts, log = _ipop_cmaes(
+            objective=lambda x, _note=reg_note, _dur=reg_dur, \
+                    _emb=region_embs[reg_idx], _mrstft=region_mrstfts[reg_idx], \
+                    _ap=region_aps[reg_idx]: \
+                _score_region(x, free_cols, pinned_cols, x0_reg,
+                              _note, _dur, profile_path, _emb, embedder, device,
+                              extra_osc, _mrstft, _ap),
+            x0=x0_free, n_dims=len(x0_free), bounds=(lo_r, hi_r),
+            sigma0=sigma0 * 0.7, popsize=max(8, popsize // 2), maxiter=maxiter,
+            score_target=0.03, verbose=verbose, verbose_prefix="    ", cma=cma,
+        )
+        n2 += n
+        restarts2 += restarts
+        for e in log: e["region"] = reg_idx
+        log2.extend(log)
+
+        if best_score < threshold:
+            best_params = x0_reg.copy()
+            for i, col in enumerate(free_cols):
+                best_params[col] = float(np.clip(best_x[i], 0.0, 1.0))
+            per_region_params.append(best_params)
+            region_scores.append(best_score)
+            if verbose:
+                print(f"    ✓ Accepted: {baseline_region_score:.4f} → {best_score:.4f} "
+                      f"(improvement {(baseline_region_score - best_score)/baseline_region_score*100:.1f}%)")
+        else:
+            per_region_params.append(None)
+            region_scores.append(baseline_region_score)
+            if verbose:
+                print(f"    ✗ Rejected: {best_score:.4f} did not beat "
+                      f"threshold {threshold:.4f} — keeping global params")
+
+    has_any_override = any(p is not None for p in per_region_params)
+    if has_any_override:
+        filled_params: list[dict[str, float]] = []
+        for reg_idx, region in enumerate(note_regions):
+            if per_region_params[reg_idx] is not None:
+                filled_params.append(per_region_params[reg_idx])
+            else:
+                mask = ((result_df["timestamp"] >= region["onset_sec"]) &
+                        (result_df["timestamp"] <= region["offset_sec"]))
+                region_df = result_df[mask] if mask.sum() > 0 else result_df
+                filled_params.append({
+                    c: float(region_df[c].median()) if c in region_df.columns else 0.5
+                    for c in all_param_cols
+                })
+
+        result_df = _stitch_with_crossfade(
+            result_df, note_regions, filled_params, all_param_cols, crossfade_sec, sr
+        )
+        audio, sr_r = render_trajectory(
+            result_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc
+        )
+        final_score = score_audio_composite(audio, sr_r, target_emb_t, embedder, device, target_mrstft, target_ap)
+        n2 += 1
+        if verbose:
+            print(f"\n  Hybrid final global score: {final_score:.4f} "
+                  f"(vs global-only: {global_score:.4f})")
+        global_score = final_score
+    else:
+        if verbose:
+            print("\n  No per-region overrides accepted — global result unchanged.")
+
+    return result_df, region_scores, global_score, n1 + n2, restarts1 + restarts2, log1 + log2
 
 
-# ── Core CMA-ES loop ─────────────────────────────────────────────────────────
+# ── IPOP CMA-ES core ──────────────────────────────────────────────────────────
 
-def _run_cmaes(
-    x0_free, x0_full, free_indices, pinned_cols, param_cols,
-    df, note_regions, profile_path, total_sec,
-    target_emb_t, embedder, device, extra_params,
-    sigma0, popsize, maxiter, verbose, cma,
-) -> tuple[np.ndarray, float, int, list[dict]]:
-    """Single CMA-ES run. Returns (best_x_free, best_score, n_renders, log)."""
-    n_free = len(x0_free)
-    es = cma.CMAEvolutionStrategy(
-        x0_free.tolist(),
-        sigma0,
-        {
-            "bounds": [[0.0] * n_free, [1.0] * n_free],
-            "maxiter": maxiter,
-            "popsize": popsize,
-            "verbose": -9,
-        },
-    )
-
-    best_x = x0_free.copy()
+def _ipop_cmaes(
+    objective, x0, n_dims, sigma0, popsize, maxiter, score_target,
+    verbose, verbose_prefix, cma,
+    bounds: tuple[list, list] | None = None,
+) -> tuple[np.ndarray, float, int, int, list]:
+    """IPOP-CMA-ES: restart with 1.5× population when stagnating."""
+    best_x = x0.copy()
     best_score = float("inf")
-    prev_best = float("inf")
-    stagnation_count = 0
+    total_renders = 0
+    total_restarts = 0
+    all_log: list[dict] = []
+    current_sigma = sigma0
+    current_pop = popsize
+
+    for restart in range(RESTART_LIMIT + 1):
+        if restart > 0 and verbose:
+            print(f"{verbose_prefix}IPOP restart {restart} "
+                  f"(σ={current_sigma:.3f}, pop={current_pop})")
+
+        x, score, n, log = _run_cmaes_once(
+            objective=objective,
+            x0=best_x.copy(),
+            n_dims=n_dims,
+            sigma0=current_sigma,
+            popsize=current_pop,
+            maxiter=maxiter,
+            score_target=score_target,
+            verbose=verbose,
+            verbose_prefix=verbose_prefix,
+            cma=cma,
+            bounds=bounds,
+        )
+        total_renders += n
+        all_log.extend(log)
+
+        if score < best_score:
+            best_score = score
+            best_x = x.copy()
+
+        if best_score <= score_target or total_restarts >= RESTART_LIMIT:
+            break
+        total_restarts += 1
+        current_pop = int(current_pop * 1.5)
+        current_sigma = max(current_sigma * 0.8, 0.03)
+
+    return best_x, best_score, total_renders, total_restarts, all_log
+
+
+def _run_cmaes_once(
+    objective, x0, n_dims, sigma0, popsize, maxiter, score_target,
+    verbose, verbose_prefix, cma,
+    bounds: tuple[list, list] | None = None,
+) -> tuple[np.ndarray, float, int, list]:
+    lo = bounds[0] if bounds else [0.0] * n_dims
+    hi = bounds[1] if bounds else [1.0] * n_dims
+    es = cma.CMAEvolutionStrategy(
+        x0.tolist(), sigma0,
+        {"bounds": [lo, hi],
+         "maxiter": maxiter, "popsize": popsize, "verbose": -9},
+    )
+    best_x = x0.copy()
+    best_score = float("inf")
     n_renders = 0
     log: list[dict] = []
 
     while not es.stop():
         xs = es.ask()
-        scores = []
-        for x in xs:
-            s = _score_x(
-                x, x0_full, free_indices, pinned_cols, param_cols,
-                df, note_regions, profile_path, total_sec,
-                target_emb_t, embedder, device, extra_params,
-            )
-            scores.append(s)
-            n_renders += 1
-            if s < best_score:
-                best_score = s
-                best_x = np.array(x).clip(0.0, 1.0)
-
+        scores = [float(objective(np.array(x))) for x in xs]
+        n_renders += len(xs)
         es.tell(xs, scores)
 
-        improvement = prev_best - best_score
-        stagnation_count = 0 if improvement > STAGNATION_THRESHOLD else stagnation_count + 1
-        prev_best = best_score
+        idx = int(np.argmin(scores))
+        if scores[idx] < best_score:
+            best_score = scores[idx]
+            best_x = np.array(xs[idx]).clip(0.0, 1.0)
 
-        log.append({"iter": len(log), "best": float(best_score),
-                    "sigma": float(es.sigma), "stagnation": stagnation_count})
-
+        log.append({"iter": len(log), "best": float(best_score), "sigma": float(es.sigma)})
         if verbose:
-            print(f"    iter {len(log):2d}  best={best_score:.4f}  "
-                  f"σ={es.sigma:.4f}  stag={stagnation_count}")
-
-        # Early exit when score is excellent
-        if best_score < 0.05:
+            print(f"{verbose_prefix}iter {len(log):2d}  best={best_score:.4f}  σ={es.sigma:.4f}")
+        if best_score <= score_target:
             break
 
     return best_x, best_score, n_renders, log
 
 
-# ── Objective function ───────────────────────────────────────────────────────
+# ── Objective helpers ─────────────────────────────────────────────────────────
 
-def _score_x(
-    x_free, x0_full, free_indices, pinned_cols, param_cols,
-    df, note_regions, profile_path, total_sec,
-    target_emb_t, embedder, device, extra_params,
+def _score_global(
+    x_free, free_cols, pinned_cols, x0_median, df, all_param_cols,
+    note_regions, profile_path, total_sec, target_emb_t, embedder, device,
+    extra_osc, target_mrstft=None, target_ap=None,
 ) -> float:
-    """Build a trial df from x_free offsets and return composite score."""
-    # Build the full param vector: start from median baseline, apply x_free.
-    x_full = x0_full.copy()
-    for i, idx in enumerate(free_indices):
-        x_full[idx] = float(np.clip(x_free[i], 0.0, 1.0))
+    trial_df = _apply_global_offsets(df, x_free, free_cols, x0_median, all_param_cols, pinned_cols)
+    audio, sr = render_trajectory(trial_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
+    return score_audio_composite(audio, sr, target_emb_t, embedder, device, target_mrstft, target_ap)
 
-    # Apply as global offset to all frames.
-    trial_df = df.copy()
-    for i, col in enumerate(param_cols):
-        if col not in pinned_cols:
-            delta = x_full[i] - float(df[col].median())
-            trial_df[col] = np.clip(trial_df[col] + delta, 0.0, 1.0)
 
-    # Render and score.
-    audio, sr = render_trajectory(
-        trial_df, note_regions, param_cols, profile_path, total_sec, extra_params
+def _score_region(
+    x_free, free_cols, pinned_cols, x0_dict, note, region_dur,
+    profile_path, target_emb_t, embedder, device, extra_osc,
+    target_mrstft=None, target_ap=None,
+) -> float:
+    params = x0_dict.copy()
+    for i, col in enumerate(free_cols):
+        params[col] = float(np.clip(x_free[i], 0.0, 1.0))
+    params_named = {col[2:]: v for col, v in params.items()}
+    return render_region_and_score(
+        params_named, note, region_dur, profile_path,
+        target_emb_t, embedder, device, extra_osc,
+        target_mrstft=target_mrstft, target_ap=target_ap,
     )
 
-    # Primary: EnCodec cosine distance.
-    primary = score_audio(audio, sr, target_emb_t, embedder, device)
 
-    # Secondary: MRSTFT (if available).
-    mrstft = _mrstft_score(audio, sr, target_emb_t, embedder, device)
+# ── Trajectory helpers ────────────────────────────────────────────────────────
 
-    return primary + MRSTFT_WEIGHT * mrstft
+def _apply_global_offsets(
+    df, x_free, free_cols, x0_median, all_param_cols, pinned_cols,
+) -> pd.DataFrame:
+    """Apply global per-param offsets uniformly across all frames."""
+    result_df = df.copy()
+    for i, col in enumerate(free_cols):
+        new_val = float(np.clip(x_free[i], 0.0, 1.0))
+        delta = new_val - x0_median.get(col, 0.5)
+        if col in result_df.columns:
+            result_df[col] = np.clip(result_df[col] + delta, 0.0, 1.0)
+        else:
+            result_df[col] = new_val
+    return result_df
 
 
-def _mrstft_score(audio, sr, target_emb_t, embedder, device) -> float:
-    """Compute normalised MRSTFT distance if embedder supports it."""
-    try:
-        import torch.nn.functional as F
-        feats = embedder.mrstft_feats(audio, sr)
-        if feats is None or len(feats) == 0:
-            return 0.0
-        # mrstft_feats returns a flat numpy array; use its L2 norm as a proxy.
-        # We don't have the target MRSTFT at this point, so skip secondary
-        # unless we cache it. For now return 0 (EnCodec only).
-        return 0.0
-    except Exception:
-        return 0.0
+def _stitch_with_crossfade(
+    df: pd.DataFrame,
+    note_regions: list[dict],
+    region_params: list[dict[str, float]],
+    all_param_cols: list[str],
+    crossfade_sec: float,
+    sr: int,
+) -> pd.DataFrame:
+    """Step-function trajectory with linear crossfade at region boundaries.
+
+    For each region, frames are set to that region's optimal params.
+    In the `crossfade_sec` window around each boundary, values are linearly
+    interpolated between adjacent region params to avoid abrupt timbral jumps.
+    """
+    result_df = df.copy()
+    for col in all_param_cols:
+        if col not in result_df.columns:
+            result_df[col] = 0.5
+
+    timestamps = result_df["timestamp"].values
+
+    # First pass: set each frame to its region's params
+    for i, (region, best_params) in enumerate(zip(note_regions, region_params)):
+        mask = ((result_df["timestamp"] >= region["onset_sec"]) &
+                (result_df["timestamp"] <= region["offset_sec"]))
+        for col in all_param_cols:
+            val = best_params.get(col, float(result_df[col].median()))
+            result_df.loc[mask, col] = float(np.clip(val, 0.0, 1.0))
+
+    # Second pass: crossfade at each boundary between adjacent regions
+    if crossfade_sec > 0:
+        for i in range(len(note_regions) - 1):
+            boundary = note_regions[i + 1]["onset_sec"]
+            half = crossfade_sec / 2.0
+            fade_mask = np.abs(timestamps - boundary) < half
+
+            if fade_mask.sum() == 0:
+                continue
+
+            for col in all_param_cols:
+                val_before = region_params[i].get(col, 0.5)
+                val_after = region_params[i + 1].get(col, 0.5)
+                if abs(val_after - val_before) < 1e-4:
+                    continue
+
+                fade_times = timestamps[fade_mask]
+                alphas = np.clip((fade_times - (boundary - half)) / crossfade_sec, 0.0, 1.0)
+                blended = val_before * (1.0 - alphas) + val_after * alphas
+                result_df.loc[fade_mask, col] = np.clip(blended, 0.0, 1.0)
+
+    return result_df
+
+
+# ── Osc config scouting ──────────────────────────────────────────────────────
+
+def _scout_osc_configs(
+    df, all_param_cols, pinned_cols, note_regions, profile_path, total_sec,
+    target_emb_t, target_mrstft, target_ap, embedder, device, sigma0, extra_bounds, verbose, cma,
+) -> tuple[str, int]:
+    free_cols = [c for c in all_param_cols if c not in pinned_cols]
+    x0_median = {c: float(df[c].median()) if c in df.columns else 0.5 for c in all_param_cols}
+    lo_s, hi_s = _make_bounds(free_cols, extra_bounds)
+    x0_free = np.clip([x0_median[c] for c in free_cols], lo_s, hi_s).astype(np.float64)
+
+    best_config = "saw"
+    best_score = float("inf")
+    total_renders = 0
+
+    if verbose:
+        print(f"\n=== Osc config scouting ===")
+
+    for config_name, osc_extra in OSC_CONFIGS.items():
+        _, score, n, _ = _run_cmaes_once(
+            objective=lambda x, _osc=osc_extra: _score_global(
+                x, free_cols, pinned_cols, x0_median, df, all_param_cols,
+                note_regions, profile_path, total_sec, target_emb_t, embedder, device, _osc,
+                target_mrstft=target_mrstft, target_ap=target_ap,
+            ),
+            x0=x0_free.copy(), n_dims=len(x0_free), bounds=(lo_s, hi_s),
+            sigma0=sigma0, popsize=SCOUT_POPSIZE, maxiter=SCOUT_MAXITER,
+            score_target=0.02, verbose=False, verbose_prefix="", cma=cma,
+        )
+        total_renders += n
+        if verbose:
+            print(f"  {config_name:10s} → {score:.4f}  ({n} renders)")
+        if score < best_score:
+            best_score = score
+            best_config = config_name
+
+    return best_config, total_renders
+
+
+# ── Region embedding / MRSTFT helpers ────────────────────────────────────────
+
+def _compute_region_mrstfts(
+    target_audio: np.ndarray,
+    sr_t: int,
+    note_regions: list[dict],
+    fallback_mrstft: np.ndarray,
+    min_samples: int | None = None,
+) -> list[np.ndarray]:
+    """MRSTFT features for each note region; falls back to full-audio features."""
+    if min_samples is None:
+        min_samples = int(0.25 * sr_t)  # ~250ms minimum for stable std estimate
+    mrstfts = []
+    for r in note_regions:
+        s = int(r["onset_sec"] * sr_t)
+        e = int(r["offset_sec"] * sr_t)
+        seg = target_audio[s:e]
+        if len(seg) >= min_samples:
+            mrstfts.append(compute_mrstft_features(seg))
+        else:
+            mrstfts.append(fallback_mrstft)
+    return mrstfts
+
+
+def _compute_region_aps(
+    target_audio: np.ndarray,
+    sr_t: int,
+    note_regions: list[dict],
+    fallback_ap: np.ndarray | None,
+    min_samples: int | None = None,
+) -> list[np.ndarray | None]:
+    """Aperiodicity features per note region; falls back to full-audio features."""
+    if min_samples is None:
+        min_samples = int(0.10 * sr_t)  # 100ms minimum for WORLD stability
+    aps = []
+    for r in note_regions:
+        s = int(r["onset_sec"] * sr_t)
+        e = int(r["offset_sec"] * sr_t)
+        seg = target_audio[s:e]
+        if len(seg) >= min_samples:
+            aps.append(compute_ap_features(seg, sr_t))
+        else:
+            aps.append(fallback_ap)
+    return aps
+
+
+def _compute_region_embs(
+    target_audio, sr_t, note_regions, embedder, device, fallback_emb_t,
+) -> list[torch.Tensor]:
+    """Embed each region's audio slice. Falls back to full-target emb if too short."""
+    MIN_SAMPLES = int(0.25 * sr_t)  # ~250ms minimum for reliable embedding
+    embs = []
+    for r in note_regions:
+        s = int(r["onset_sec"] * sr_t)
+        e = int(r["offset_sec"] * sr_t)
+        seg = target_audio[s:e]
+        if len(seg) >= MIN_SAMPLES:
+            emb = torch.tensor(
+                embedder.encodec_embed(seg, sr_t, pool="mean"),
+                dtype=torch.float32, device=device,
+            )
+        else:
+            emb = fallback_emb_t  # region too short — use full-target embedding
+        embs.append(emb)
+    return embs

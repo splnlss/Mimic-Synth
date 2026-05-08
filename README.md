@@ -7,14 +7,14 @@ A pipeline for building audio datasets from synthesizers and training models tha
 | Stage | Folder | Status | Purpose |
 |-------|--------|--------|---------|
 | S01 | `s01_profiles/` | ✅ Complete | Synth profile — parameter definitions, importance weights, probe config |
-| S02 | `s02_capture/` | 🔄 Active | Capture rig — renders (param vector, note) to WAV via DawDreamer |
-| S03 | `s03_dataset/` | ⏳ Pending | Dataset builder — Sobol sampling, quality gates, manifest, verifier |
-| S04 | `s04_embed/` | ⏳ Pending | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
+| S02 | `s02_capture/` | ✅ Complete | Capture rig — renders (param vector, note) to WAV via DawDreamer |
+| S03 | `s03_dataset/` | ✅ Complete | Dataset builder — Sobol sampling, quality gates, manifest, verifier |
+| S04 | `s04_embed/` | ✅ Complete | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
 | S05 | `s05_surrogate/` | ✅ Complete | Forward model — MLP mapping (params, note) → EnCodec latent |
 | S06 | `s06_invert/` | ✅ Complete | Patch search — grad descent + CMA-ES inversion of target audio |
-| **S06b** | `s06b_live/` | ✅ Working | **Inversion** — surrogate-driven: note segmentation, per-region MIDI, PINNED_PARAMS, α-refinement. Fast (~30s). |
-| **S07** | `s07_refine/` | ✅ Working | **Refinement** — real-VST-driven: hill-climb + CMA-ES with osc config scouting. No surrogate. Best quality (~15 min). |
-| S08 | `s08_package/` | 🔲 Planned | Package — ONNX export + nn~ / Max/Pd integration |
+| **S06b** | `s06b_live/` | ✅ Working | **Inversion** — surrogate-driven: note segmentation, pyworld pitch tracking, MIDI pitch bend, PINNED_PARAMS, α-refinement. Fast (~30s). |
+| **S07** | `s07_refine/` | ✅ Working | **Refinement** — real-VST-driven: hill-climb + CMA-ES (global/per-region/hybrid) with expanded 22-param space and composite scoring. No surrogate. Best quality (~15 min). |
+| S08 | `s08_package/` | 🔲 Planned | Package — ONNX export for deployment |
 
 ---
 
@@ -169,9 +169,14 @@ S06b and S07 are two distinct stages that run in sequence. Understanding the dif
 | **Output quality** | cosine dist ~0.10 | cosine dist ~0.03–0.09 |
 | **Use when** | Iterating, previewing | Final render |
 
-**S06b** uses gradient descent through the frozen surrogate — fast because it avoids the VST entirely during search. S06b also includes an α-refinement loop that scales the surrogate's suggested direction by testing a handful of real renders. This alone drops from ~0.21 to ~0.10.
+**S06b** uses gradient descent through the frozen surrogate — fast because it avoids the VST entirely during search. Pitch is tracked using pyworld F0 (5ms resolution, full-audio, deterministic) with an autocorrelation fallback. Fine pitch glides are written as MIDI pitch bend automation (affecting all oscillators simultaneously), not Osc 1 Pitch VST automation. S06b also runs an α-refinement loop that scales the surrogate's suggested direction by testing a handful of real renders, dropping from ~0.21 to ~0.10.
 
-**S07** abandons the surrogate and evaluates every candidate by rendering through OB-Xf. S07 Strategy 1 (hill-climb) does per-param coordinate descent. S07 Strategy 2 (CMA-ES) additionally scouts oscillator waveform configurations (saw, pulse, saw+pulse) and runs a population-based search that learns parameter correlations.
+**S07** abandons the surrogate and evaluates every candidate by rendering through OB-Xf. S07 Strategy 1 (hill-climb) does per-param coordinate descent. S07 Strategy 2 (CMA-ES) scouts oscillator waveform configurations, runs a population-based search across an **expanded 22-parameter space** (15 surrogate params + 7 extra: Filter Env ADSR, Osc 2 Volume, Amp Env Sustain, Unison Detune), and scores each candidate using a composite distance: **EnCodec 50% + MRSTFT 30% + aperiodicity 20%**.
+
+CMA-ES operates in three modes:
+- **`global`** (fastest): single CMA-ES pass applying global per-param offsets. Achieved **0.029** on crane scream.
+- **`per-region`** (experimental): independent CMA-ES per note region, each scored against that region's own target embedding. Prone to discontinuities on short regions.
+- **`hybrid`** (default): global first, then per-region fine-tune where it beats the global result by >5%. Linear crossfade at region boundaries.
 
 **All targets are automatically converted to mono** — if you pass a stereo file, the pipeline saves `<stem>_mono.wav` alongside it and uses that. For 3+ channels you will be prompted for instructions.
 
@@ -194,7 +199,7 @@ conda run -n mimic-synth python -m s06b_live.stream_invert \
     --target path/to/target.wav
 ```
 
-For each unpinned parameter, tries offsets ±0.05 and ±0.15 globally across all frames; keeps the offset that lowers the real-render cosine distance. Saves `hill_climb_log.yaml` showing which params moved and by how much (useful diagnostic).
+For each unpinned parameter, tries offsets ±0.05 and ±0.15 globally across all frames; keeps the offset that lowers the composite scoring distance. Saves `hill_climb_log.yaml` showing which params moved and by how much.
 
 #### Mode 3 — Full quality (~15 min): + CMA-ES (S07 Strategy 2)
 
@@ -203,22 +208,24 @@ conda run -n mimic-synth python -m s06b_live.stream_invert \
     --target path/to/target.wav --cmaes
 ```
 
-Runs target analysis (spectral centroid, ADSR estimation, harmonic ratio, LFO detection) to answer 5 design questions and warm-start the CMA-ES. Scouts 3 oscillator configs, runs CMA-ES on the best, restarts with larger population if it stagnates. Achieved **0.029 cosine distance** on the crane scream (saw+pulse config, vs 0.21 surrogate-only).
+Runs target analysis (spectral centroid, ADSR estimation, harmonic ratio, LFO detection) to warm-start the CMA-ES. Scouts 3 oscillator configs, then runs the selected config in hybrid mode (global + per-region fine-tune). IPOP restart with 1.5× population if stagnating. Achieved **0.029 cosine distance** on the crane scream (saw+pulse config, vs 0.21 surrogate-only).
 
 CMA-ES tuning flags:
 
 | Flag | Default | Effect |
 |---|---|---|
+| `--cmaes-mode` | `hybrid` | `global` / `per-region` / `hybrid` |
 | `--cmaes-sigma0` | 0.08 | Search radius: 0.05=refine, 0.12=explore |
 | `--cmaes-popsize` | 16 | Population per iteration |
 | `--cmaes-maxiter` | 20 | Max iterations before restart |
 
-Output files per run: `stream_params.parquet`, `pitch_trajectory.yaml`, `best_patch.yaml`, `rendered.wav`, `rendered_normalized.wav`, `hill_climb_log.yaml` (if hill-climb ran), `cmaes_log.yaml` (if CMA-ES ran).
+Output files per run: `stream_params.parquet`, `pitch_trajectory.yaml`, `fine_pitch_trajectory.yaml`, `pitch_bend.mid`, `best_patch.yaml`, `rendered.wav`, `rendered_normalized.wav`, `hill_climb_log.yaml` (if hill-climb ran), `cmaes_log.yaml` (if CMA-ES ran).
 
 Key design constraints (all required for correct audio):
 
 - **`PINNED_PARAMS`** — `Osc 1 Pitch=0.5` (no transpose; pitch comes from MIDI note), `Amp Env Release=0.2` (prevents notes ringing through), `LFO 1 to Osc 1 Pitch=0.0` (no pitch wobble). Without these the surrogate AND the real-synth search both find degenerate solutions.
 - **`surrogate_note`** — detected MIDI note snapped to nearest profile training note for the surrogate context; exact MIDI note used for DawDreamer render. Keeps the surrogate in-distribution.
+- **Pitch bend via MIDI file** — fine pitch tracking (pyworld + autocorr fallback at 10ms) is written as a `.mid` file with calibrated ±6st bend range. This moves all oscillators together, unlike Osc 1 Pitch VST automation.
 - **Reset values applied before every render** — `audio_compare.py` applies all profile reset values first so OB-Xf starts from a known state regardless of previous plugin state.
 
 ---
@@ -356,10 +363,13 @@ target.wav → EnCodec → target_embedding [128-d]
 ```
 target.wav  ──► mono conversion (auto)
                       ↓
-        energy + pitch-jump segmentation @ 10 ms → note regions
+        pyworld F0 @ 5ms (full-audio, deterministic)
+          → voiced/unvoiced tracking, no octave errors
+          → fallback: per-frame autocorrelation
                       ↓
-        per region:  midi_note (exact, → DawDreamer)
-                     surrogate_note (snapped to profile, → surrogate)
+        energy + pitch-jump segmentation @ 10ms → note regions
+          per region: midi_note (exact, → DawDreamer)
+                      surrogate_note (snapped to profile, → surrogate)
                       ↓
         per coarse frame (100ms window, 50ms hop):
             grad_invert(surrogate, frame_emb, surrogate_note,
@@ -367,9 +377,13 @@ target.wav  ──► mono conversion (auto)
                                          Amp Env Release=0.2,
                                          LFO 1 to Osc 1 Pitch=0.0})
                       ↓
-        stream_params.parquet  +  pitch_trajectory.yaml
+        stream_params.parquet  +  fine_pitch_trajectory.yaml
                       ↓
-        render (DawDreamer, per-region note-on/off, reset values applied)
+        render (DawDreamer):
+          - MIDI file with note-on/off + pitch bend automation @ 10ms
+            (calibrated ±6st range, moves all oscillators together)
+          - per-param VST automation from stream_params
+          - reset values applied before render
                       ↓
         α-refinement: surrogate gradient → direction, real renders → scaling
                       ↓
@@ -382,10 +396,11 @@ target.wav  ──► mono conversion (auto)
 stream_params.parquet (from S06b)
                       ↓
     ┌─── Strategy 1: Hill-climb (default, ~5 min) ───────────────────────┐
+    │  score = EnCodec (50%) + MRSTFT (30%) + aperiodicity (20%)         │
     │  for each unpinned param p:                                         │
     │      for offset in [-0.15, -0.05, +0.05, +0.15]:                  │
     │          trial = clip(all_frames[p] + offset, 0, 1)                │
-    │          score = real_render_and_embed(trial)                       │
+    │          score = real_render_composite(trial)                       │
     │      keep offset that lowers score                                  │
     │  repeat until no param improves → hill_climb_log.yaml              │
     └────────────────────────────────────────────────────────────────────┘
@@ -397,12 +412,18 @@ stream_params.parquet (from S06b)
     │                   spectral flux → Filter Env Amount / LFO rate      │
     │                   → smart x0 blended with hill-climb result         │
     │                                                                      │
+    │  parameter space: 15 surrogate + 7 extra (Filter Env ADSR,         │
+    │      Osc 2 Volume, Amp Env Sustain, Unison Detune) = 22 total       │
+    │                                                                      │
     │  osc config scouting: saw / pulse / saw+pulse × short CMA-ES        │
     │  → best config (saw+pulse won on crane scream)                       │
     │                                                                      │
-    │  full CMA-ES on winning config (popsize=16, maxiter=20)             │
+    │  CMA-ES mode (hybrid default):                                       │
+    │    Phase 1 — global: single pass over all frames (fast, ~0.029)    │
+    │    Phase 2 — per-region: fine-tune regions ≥ 400ms where it        │
+    │              beats global by >5%; crossfade at boundaries           │
     │  IPOP restart: 1.5× population if stagnating                        │
-    │  → cmaes_log.yaml (param deltas, osc config, n_renders)             │
+    │  → cmaes_log.yaml (param deltas, mode, osc config, n_renders)      │
     └────────────────────────────────────────────────────────────────────┘
                       ↓  [cosine dist ≈ 0.03–0.04]
                   rendered.wav  (timestamped subfolder)
@@ -411,6 +432,48 @@ stream_params.parquet (from S06b)
 `PINNED_PARAMS` is enforced at every stage. Without them the optimizer shifts pitch +24 semitones and holds notes indefinitely — both produce lower embedding distance but completely wrong audio.
 
 Output is synth knob positions (0–1 per parameter). Load `best_patch.yaml` onto the synth and play the recovered MIDI note to hear the result.
+
+---
+
+---
+
+## Accuracy improvements — quality roadmap
+
+The current pipeline produces a recognizable approximation of the source: correct rhythm, correct pitch regions, some timbral overlap. Several root causes limit quality and point to concrete improvements:
+
+### Richer synthesis
+
+The surrogate was trained on static single-note patches. The most impactful changes require no retraining:
+
+- **Per-frame Filter Cutoff automation** from spectral centroid trajectory. Currently Filter Cutoff is a static parameter. Sweeping it from near-open to near-closed following the source's spectral centroid over the note duration is the single change most likely to remove the "static" character.
+- **Oscillator interval snapping** — treat Osc 2 Pitch as a discrete outer loop (unison, +3st, +7st, +12st) rather than a continuous CMA-ES parameter. Richer harmonic structure for essentially no extra renders.
+- **Unison voices** — Unison Detune at 0.2–0.4 immediately makes any patch sound denser. Should be near-default, not CMA-ES-discovered.
+- **Noise burst at attack** — route noise through a fast-decay envelope (short Filter Env Decay at high Filter Env Amount). Gives the percussive "click" at note onset most organic sounds have.
+
+### Better target analysis
+
+The current `target_analysis.py` answers 5 heuristic design questions. Grounding them in signal analysis would give more reliable warm-starts:
+
+- **pyworld spectral envelope (SP)** as a direct filter target — SP is the smooth spectral shape per frame and maps directly to Filter Cutoff trajectory and Filter Resonance. Already available from `pyworld.wav2world()`, which the pipeline calls for F0/AP.
+- **Attack transient decomposition** — identify transient events (< 50ms) by onset detection, measure peak frequency and duration, constrain Amp Env Attack and Filter Env Attack directly.
+- **Harmonic structure classification** — use pyworld aperiodicity (AP) mean to gate oscillator selection explicitly: AP < 0.2 → saw/saw+pulse, AP 0.2–0.5 → saw+pulse + noise, AP > 0.5 → noise-dominant. Currently implicit in CMA-ES scoring.
+- **Inharmonicity fingerprinting** — measure deviation of spectral peaks from integer ratios. Gives a direct objective for Ring Mod and Cross Modulation depth, which currently only emerge by accident.
+
+### Better scoring
+
+- **Per-frame SP distance** (pyworld) as an additional scoring term: `score = 0.40×EnCodec + 0.25×MRSTFT + 0.20×AP + 0.15×SP`. Directly rewards the optimizer for matching filter movement frame-by-frame.
+- **Pitch-invariant timbral scoring** — pitch-shift the render to match the source before embedding, so cosine distance measures timbre rather than penalizing small pitch errors.
+- **LUFS normalization** before all comparisons, so level differences don't bias the optimizer toward level-matched rather than timbre-matched solutions.
+
+### Better optimization
+
+- **Hierarchical search** — separate coarse (discrete: oscillator type, Osc 2 interval, ring mod on/off) from medium (ADSR set analytically from target waveform) from fine (CMA-ES on the remaining 8–10 parameters). Shrinks the effective CMA-ES search space 3–5×.
+- **DDSP analysis as CMA-ES warm-start** — Google's DDSP extracts continuous filter cutoff and harmonic amplitude trajectories analytically. Using those as x0 instead of the current target_analysis heuristics would give dramatically better convergence.
+- **Surrogate retrained on production data** — the current surrogate was trained on dev-scale data. An M=14 production retrain with extra params (Filter Env ADSR, Osc 2 Volume) in the input would improve gradient inversion quality and widen the explorable parameter space.
+
+### Offline synth calibration
+
+One-time parameter sweeps through OB-Xf (Filter Cutoff 0→1 while measuring spectral centroid; Resonance 0→1 while measuring peak Q; LFO Rate 0→1 while measuring LFO Hz) would replace the current "guess and score" approach with a lookup table: "source has spectral centroid at 800Hz → set Filter Cutoff to 0.38."
 
 ---
 
