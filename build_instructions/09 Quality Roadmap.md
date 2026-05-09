@@ -212,25 +212,32 @@ For complex, layered sounds: render two independent OB-Xf instances simultaneous
 
 ## VII. Priority Order for Implementation
 
-| Priority | Change | Expected improvement | Effort |
+| Priority | Change | Expected improvement | Effort | Status |
+|---|---|---|---|---|
+| 1 | Per-frame Filter Cutoff automation from spectral centroid | Removes "static" character; most audible single change | Medium | ✅ Done — pyworld SP + librosa centroid → per-frame trajectory in stream_params.parquet |
+| 2 | Offline synth calibration curves | Accurate parameter → frequency mapping | Low | ✅ Done — `calibrate_synth.py`; `obxf_calibration.npz` (420→4134 Hz); used in `_centroid_hz_to_filter_cutoff` and `target_analysis` |
+| 3 | Osc 2 interval snapping (discrete octave/fifth/unison search) | Richer harmonic structure | Low | ✅ Done — `_scout_osc2_intervals` in `vst_cmaes.py`; 7 intervals scouted before main CMA-ES |
+| 4 | Spectral envelope (pyworld SP) as scoring term | Better filter matching | Medium | 🔲 Pending |
+| 5 | Attack transient constraint (Amp Env Attack < transient duration) | Correct attack character | Low | 🔲 Pending |
+| 6 | DDSP analysis to initialise CMA-ES x0 | Better convergence, fewer renders | High | 🔲 Pending (blocked on trained encoder) |
+| 7 | Surrogate retrained on M=14 data with extra params | Better gradient inversion | High (blocked on S02) | 🔲 Pending |
+| 8 | Temporal surrogate (per-frame trajectories) | True dynamic synthesis | Very high | 🔲 Pending |
+| 9 | Multi-instance render | Richer layering | Medium | 🔲 Pending |
+| 10 | Learned synthesis parameter prediction (neural) | Fast inference, no CMA-ES | Very high (data-hungry) | 🔲 Pending |
+
+**Library quick-wins — all completed:**
+
+| Change | Library | Section | Status |
 |---|---|---|---|
-| 1 | Per-frame Filter Cutoff automation from spectral centroid | Removes "static" character; most audible single change | Medium |
-| 2 | Offline synth calibration curves | Accurate parameter → frequency mapping | Low |
-| 3 | Osc 2 interval snapping (discrete octave/fifth/unison search) | Richer harmonic structure | Low |
-| 4 | Spectral envelope (pyworld SP) as scoring term | Better filter matching | Medium |
-| 5 | Attack transient constraint (Amp Env Attack < transient duration) | Correct attack character | Low |
-| 6 | DDSP analysis to initialise CMA-ES x0 | Better convergence, fewer renders | High |
-| 7 | Surrogate retrained on M=14 data with extra params | Better gradient inversion | High (blocked on S02) |
-| 8 | Temporal surrogate (per-frame trajectories) | True dynamic synthesis | Very high |
-| 9 | Multi-instance render | Richer layering | Medium |
-| 10 | Learned synthesis parameter prediction (neural) | Fast inference, no CMA-ES | Very high (data-hungry) |
+| LUFS-normalise target and render before all scoring | [`pyloudnorm`](https://github.com/csteinmetz1/pyloudnorm) | §III.D | ✅ Done — `audio_compare.py:_lufs_normalize`, applied in all scoring paths |
+| Replace hand-rolled MRSTFT with battle-tested differentiable version | [`auraloss`](https://github.com/csteinmetz1/auraloss) | §III.A | ✅ Done — `audio_compare.py:_MRSTFT_LOSS` |
+| Add SP and AP via existing pyworld call (`cheaptrick` + `d4c`) | pyworld (already loaded) | §II.A, §II.C, §III.A | ✅ Done — SP and AP in scoring composite |
 
-The first three items require no new ML training and could be implemented in days. They address the "too sparse" character directly. Items 4–5 refine the objective function. Items 6–10 are longer-term architectural changes.
+**Additional completed items (not in original roadmap):**
 
-**Library quick-wins (hours, not days).** Three foundational changes are pure library swaps and should land before anything else, because every later item benefits from them:
-
-| Change | Library | Section |
-|---|---|---|
-| LUFS-normalise target and render before all scoring | [`pyloudnorm`](https://github.com/csteinmetz1/pyloudnorm) | §III.D |
-| Replace hand-rolled MRSTFT with battle-tested differentiable version | [`auraloss`](https://github.com/csteinmetz1/auraloss) (already in `requirements.txt`, unused) | §III.A |
-| Add SP and AP via existing pyworld call (`cheaptrick` + `d4c`) | pyworld (already loaded) | §II.A, §II.C, §III.A |
+| Change | Status |
+|---|---|
+| CREPE neural F0 replacing pyworld DIO in target_analysis | ✅ Done — `_crepe_f0()` in `target_analysis.py` |
+| Harmonic amplitude extraction (DDSP-style) for warm-start | ✅ Done — `_harmonic_amplitudes()` in `target_analysis.py` |
+| CMA-ES checkpoint-on-improvement (write rendered.wav at each IPOP restart) | ✅ Done — `on_improvement` callback threaded through `cmaes_refine → _run_global → _ipop_cmaes` |
+| Ring mod 350ms post-smooth to prevent 5–20kHz aliasing at region boundaries | ✅ Done — `_SLOW_PARAMS` smooth after `cmaes_refine` in `stream_invert.py` |

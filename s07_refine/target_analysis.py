@@ -108,6 +108,15 @@ class TargetAnalysis:
     # Diagnostics
     notes: list[str] = field(default_factory=list)
 
+    # CREPE + DDSP-style harmonic analysis (populated when torchcrepe available)
+    noise_volume_est:         float = 0.0    # from d4c AP mean → Noise Volume [0, 0.40]
+    filter_env_attack_est:    float = 0.0    # centroid rise time → Filter Env Attack
+    filter_env_decay_est:     float = 0.3    # centroid fall time → Filter Env Decay
+    filter_env_sustain_est:   float = 0.8    # steady-state brightness → Filter Env Sustain
+    harmonic_richness:        float = 0.5    # overtone strength relative to fundamental → Osc 2 Volume
+    harmonic_slope_resonance: float = 0.2    # harmonic decay slope → Filter Resonance (replaces flatness)
+    f0_source:                str   = "hps"  # "crepe" | "dio" | "hps" — diagnostic
+
 
 # ── Core analysis ────────────────────────────────────────────────────────────
 
@@ -194,11 +203,10 @@ def analyze_target(
 
     # ── Q3: Filter parameters ────────────────────────────────────────────────
 
-    # Filter cutoff: map spectral centroid to OB-Xf cutoff parameter.
-    # The OB-Xf lowpass filter at param 0.5 ≈ 1000-2000 Hz depending on
-    # tracking. High centroid (bright) → needs high cutoff to pass content.
-    # Reference: Yee-King (2011) Eq. 3 - linear mapping with modest scaling.
-    filter_cutoff_est = float(np.clip(0.3 + spectral_centroid_norm * 0.6, 0.3, 0.95))
+    # Filter cutoff: map spectral centroid → OB-Xf cutoff parameter.
+    # Uses measured calibration table from calibrate_synth.py when available;
+    # falls back to heuristic linear approximation otherwise.
+    filter_cutoff_est = float(_centroid_hz_to_cutoff(centroid_hz, sr))
 
     # Resonance: sharp spectral peaks suggest the target has a prominent
     # formant / resonance; match with synth resonance.
@@ -231,17 +239,81 @@ def analyze_target(
 
     # ── Q5: Pitch / cross-modulation ────────────────────────────────────────
 
-    # Cross Modulation (FM) is useful for bell-like, metallic, or distinctly
-    # inharmonic sounds. High inharmonicity → try some cross-mod.
-    # Note: Osc 1 Pitch is pinned; we can't do true pitch tracking here.
-    # But we can recommend whether cross-mod is likely helpful.
     cross_mod_est = float(np.clip(inharmonicity * 0.25, 0.0, 0.25))
-
-    # Osc 2 Detune: slight detune adds thickness; more detune adds chorus/beating.
-    # For pitched tonal sounds: keep near unison (0.5 ± 0.05).
-    # For inharmonic/noise: allow more detune.
     osc2_detune_est = 0.5 + float(np.clip(inharmonicity * 0.1, -0.1, 0.1))
     osc2_detune_est = float(np.clip(osc2_detune_est, 0.4, 0.6))
+
+    # ── CREPE + DDSP-style harmonic analysis ─────────────────────────────────
+    # Try CREPE for better F0, fall back to DIO inside _pyworld_analysis.
+    noise_volume_est         = 0.0
+    filter_env_attack_est    = 0.0
+    filter_env_decay_est     = 0.3
+    filter_env_sustain_est   = 0.8
+    harmonic_richness        = 0.5
+    harmonic_slope_resonance = filter_resonance_est   # start from Welch-based estimate
+    f0_source                = "hps"
+
+    crepe_result = _crepe_f0(audio.astype(np.float32), sr)
+    if crepe_result is not None:
+        f0_ext, t_ext = crepe_result
+        f0_source = "crepe"
+        notes.append(f"f0_source: CREPE ({int((f0_ext > 0).sum())} voiced frames)")
+    else:
+        f0_ext, t_ext = None, None
+
+    world = _pyworld_analysis(audio.astype(np.float32), sr,
+                              f0_external=f0_ext, t_external=t_ext)
+    if world is None and crepe_result is None:
+        f0_source = "hps"
+
+    if world is not None:
+        ct = world["centroid_norm"]   # per voiced frame
+
+        # Override centroid (SP-based is more accurate than Welch)
+        spectral_centroid_norm = float(np.median(ct))
+        filter_cutoff_est = float(np.clip(0.3 + spectral_centroid_norm * 0.6, 0.3, 0.90))
+
+        # Noise Volume from d4c aperiodicity
+        noise_volume_est = float(np.clip(world["noise_level"] * 0.8, 0.0, 0.40))
+
+        # Filter Env ADSR from spectral centroid trajectory timing
+        if len(ct) >= 4:
+            peak_idx = int(np.argmax(ct))
+            n_ct     = len(ct)
+            filter_env_attack_est = _ms_to_filter_env_param(peak_idx * 5.0)
+            if peak_idx < n_ct - 1:
+                tail      = ct[peak_idx:]
+                decay_end = int(np.argmin(np.abs(tail - np.median(ct)))) + peak_idx
+                filter_env_decay_est = _ms_to_filter_env_param((decay_end - peak_idx) * 5.0)
+            filter_env_sustain_est = float(np.clip(
+                np.median(ct) / max(float(ct.max()), 1e-6), 0.0, 1.0
+            ))
+
+        # Harmonic richness: low AP = strong harmonics
+        harmonic_richness = float(np.clip(1.0 - world["noise_level"] * 2.0, 0.0, 1.0))
+
+        # Refine filter_env_amount from centroid variation (better than flux)
+        if ct.mean() > 0:
+            filter_env_amount_est = float(np.clip(ct.std() / ct.mean() * 0.5, 0.0, 0.5))
+
+        # Harmonic slope resonance from per-harmonic amplitudes
+        f0_world = world["f0"]
+        harm_amps = _harmonic_amplitudes(
+            audio.astype(np.float32), sr, f0_world, world["t"]
+        )
+        if harm_amps is not None:
+            voiced_harms = harm_amps[f0_world > 30.0]
+            if len(voiced_harms) > 0:
+                h1   = voiced_harms[:, 0].mean()
+                h2_4 = voiced_harms[:, 1:4].mean()
+                harmonic_richness = float(np.clip(h2_4 / max(h1, 1e-8), 0.0, 1.0))
+
+                mean_amps = voiced_harms.mean(axis=0)
+                k_vals    = np.arange(1, mean_amps.shape[0] + 1)
+                safe_amps = np.where(mean_amps > 0, mean_amps, 1e-8)
+                slope     = np.polyfit(k_vals, np.log(safe_amps), 1)[0]
+                # Steeper negative slope → darker/filtered → lower resonance
+                harmonic_slope_resonance = float(np.clip(-slope * 2.0, 0.05, 0.30))
 
     return TargetAnalysis(
         spectral_centroid_norm=spectral_centroid_norm,
@@ -264,6 +336,13 @@ def analyze_target(
         cross_mod_est=cross_mod_est,
         osc2_detune_est=osc2_detune_est,
         notes=notes,
+        noise_volume_est=noise_volume_est,
+        filter_env_attack_est=filter_env_attack_est,
+        filter_env_decay_est=filter_env_decay_est,
+        filter_env_sustain_est=filter_env_sustain_est,
+        harmonic_richness=harmonic_richness,
+        harmonic_slope_resonance=harmonic_slope_resonance,
+        f0_source=f0_source,
     )
 
 
@@ -296,7 +375,8 @@ def suggest_x0(
     suggestions: dict[str, float] = {
         # Q3 — filter
         "Filter Cutoff":      analysis.filter_cutoff_est,
-        "Filter Resonance":   analysis.filter_resonance_est,
+        # Use CREPE/DDSP harmonic slope for resonance when available (more physical)
+        "Filter Resonance":   analysis.harmonic_slope_resonance,
         "Filter Mode":        analysis.filter_mode_est,
         "Filter Env Amount":  analysis.filter_env_amount_est,
         # Q2 — amp envelope (attack/decay; release is PINNED)
@@ -308,8 +388,15 @@ def suggest_x0(
         # Q1/Q5 — oscillator
         "Osc 2 Detune":       analysis.osc2_detune_est,
         "Cross Modulation":   analysis.cross_mod_est,
-        "Osc Pulsewidth":     0.5,     # neutral default; osc config handles wave type
+        "Osc Pulsewidth":     0.5,     # neutral; osc config handles wave type
         "Osc 1 Volume":       0.7,     # safe default; osc 1 is primary
+        # CREPE/DDSP-derived extra param estimates (were at reset defaults before)
+        "Noise Volume":           analysis.noise_volume_est,
+        "Ring Mod Volume":        float(np.clip(analysis.inharmonicity * 0.15, 0.0, 0.20)),
+        "Filter Env Attack":      analysis.filter_env_attack_est,
+        "Filter Env Decay":       analysis.filter_env_decay_est,
+        "Filter Env Sustain":     analysis.filter_env_sustain_est,
+        "Osc 2 Volume":           float(np.clip(analysis.harmonic_richness * 0.4, 0.0, 0.50)),
     }
 
     if current_x0 is not None:
@@ -334,6 +421,197 @@ def suggest_x0(
 
 
 # ── Private helpers ──────────────────────────────────────────────────────────
+
+def _crepe_f0(
+    audio: np.ndarray,
+    sr: int,
+    hop_ms: float = 5.0,
+    fmin: float = 50.0,
+    fmax: float = 2000.0,
+    periodicity_threshold: float = 0.21,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """CREPE neural pitch detection. Returns (f0_hz, t_sec) at hop_ms intervals.
+
+    Much more accurate than pyworld DIO for non-speech audio (bird calls,
+    instruments). Requires audio resampled to 16kHz internally (pitfall 2).
+
+    Returns None when torchcrepe unavailable, audio < 100ms, or inference fails.
+    Frames below periodicity_threshold are set to F0=0 (unvoiced, pitfall 3).
+    """
+    try:
+        import torchcrepe
+        import torchaudio
+        import torch
+    except ImportError:
+        return None
+    if len(audio) < int(sr * 0.10):
+        return None
+    try:
+        audio_t = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0)  # [1, T]
+        audio_16k = torchaudio.functional.resample(audio_t, sr, 16000)
+        hop_samples_16k = max(1, int(16000 * hop_ms / 1000.0))  # 5ms → 80 samples
+
+        freq, periodicity = torchcrepe.predict(
+            audio_16k, 16000,
+            hop_length=hop_samples_16k,
+            fmin=fmin, fmax=fmax,
+            model="tiny",           # 17MB; fast; cached after first download
+            return_periodicity=True,
+            device="cpu",           # never call inside scoring loop — only here
+            batch_size=512,
+        )
+        freq = freq.squeeze(0).numpy().astype(np.float64)      # [n_frames]
+        periodicity = periodicity.squeeze(0).numpy()
+        freq[periodicity < periodicity_threshold] = 0.0         # unvoiced frames
+        t = np.arange(len(freq)) * (hop_ms / 1000.0)
+        return freq, t
+    except Exception:
+        return None
+
+
+def _pyworld_analysis(
+    audio: np.ndarray,
+    sr: int,
+    f0_external: np.ndarray | None = None,
+    t_external: np.ndarray | None = None,
+) -> dict | None:
+    """WORLD vocoder decomposition: SP (spectral envelope) + AP (aperiodicity).
+
+    If f0_external/t_external are provided (e.g. from CREPE), uses them instead
+    of pw.dio+stonemask — this is the key CREPE integration point.
+
+    Returns dict with keys: f0, sp, ap, t, voiced, centroid_norm, noise_level.
+    Returns None when pyworld unavailable, audio too short, or analysis fails.
+    """
+    try:
+        import pyworld as pw
+    except ImportError:
+        return None
+    if len(audio) < int(sr * 0.10):
+        return None
+    try:
+        audio64 = audio.astype(np.float64)
+
+        if f0_external is not None and t_external is not None:
+            f0, t = f0_external, t_external
+        else:
+            f0, t = pw.dio(audio64, sr)
+            f0 = pw.stonemask(audio64, f0, t, sr)
+
+        sp = pw.cheaptrick(audio64, f0, t, sr)   # [n_frames, fft//2+1]
+        ap = pw.d4c(audio64, f0, t, sr)           # [n_frames, fft//2+1]
+
+        voiced = f0 > 30.0
+        if not voiced.any():
+            return None
+
+        freqs = np.linspace(0.0, sr / 2.0, sp.shape[1])
+        sp_v = sp[voiced]
+        sp_power = sp_v.sum(axis=1)
+        safe = np.where(sp_power > 0, sp_power, 1.0)
+        centroid_hz = (sp_v * freqs[np.newaxis, :]).sum(axis=1) / safe
+        centroid_norm = np.clip(centroid_hz / (sr / 2.0), 0.0, 1.0)  # [n_voiced]
+
+        noise_level = float(ap[voiced].mean())   # AP: 0=harmonic, 1=noise
+
+        return {
+            "f0": f0, "sp": sp, "ap": ap, "t": t,
+            "voiced": voiced,
+            "centroid_norm": centroid_norm,
+            "noise_level": noise_level,
+        }
+    except Exception:
+        return None
+
+
+def _harmonic_amplitudes(
+    audio: np.ndarray,
+    sr: int,
+    f0_hz: np.ndarray,
+    t_pw: np.ndarray,
+    n_fft: int = 2048,
+    hop_length: int = 240,      # 5ms at 48kHz
+    n_harmonics: int = 16,
+    max_harmonic_hz: float = 8000.0,
+) -> np.ndarray | None:
+    """Per-harmonic amplitude envelopes A_k(t) — the DDSP harmonic synthesizer input.
+
+    For each voiced frame t and harmonic k, reads the STFT magnitude at k*F0(t)
+    with sub-bin interpolation (pitfall 7). Caps harmonics above max_harmonic_hz
+    where spectral smoothing dominates real partials (pitfall 8).
+
+    Returns float32 array [n_pw_frames, n_harmonics] or None on failure.
+    Unvoiced frames have all-zero amplitudes.
+    """
+    try:
+        voiced = f0_hz > 30.0
+        if not voiced.any():
+            return None
+
+        _, t_stft, Zxx = signal.stft(
+            audio.astype(np.float32), fs=sr,
+            nperseg=n_fft, noverlap=n_fft - hop_length,
+            window='hann',
+        )
+        mag = np.abs(Zxx)   # [n_fft//2+1, n_stft_frames]
+
+        result = np.zeros((len(f0_hz), n_harmonics), dtype=np.float32)
+        freq_per_bin = sr / n_fft
+
+        for i in range(len(f0_hz)):
+            f0 = f0_hz[i]
+            if f0 <= 0 or not voiced[i]:
+                continue
+            stft_idx = int(np.argmin(np.abs(t_stft - t_pw[i])))
+            stft_idx = min(stft_idx, mag.shape[1] - 1)
+            spec = mag[:, stft_idx]
+
+            for k in range(1, n_harmonics + 1):
+                harm_hz = k * f0
+                if harm_hz > max_harmonic_hz or harm_hz >= sr / 2.0:
+                    break
+                bin_f = harm_hz / freq_per_bin
+                bin_lo = int(bin_f)
+                bin_hi = min(bin_lo + 1, spec.shape[0] - 1)
+                alpha = bin_f - bin_lo
+                result[i, k - 1] = float((1 - alpha) * spec[bin_lo] + alpha * spec[bin_hi])
+
+        return result
+    except Exception:
+        return None
+
+
+def _ms_to_filter_env_param(ms: float) -> float:
+    """Map envelope time (ms) to OB-Xf Filter Env param [0, 1] (log scale)."""
+    return float(np.clip(np.log10(max(ms, 1.0)) / 4.0, 0.0, 1.0))
+
+
+_FILTER_CALIB_TA: dict | None = None   # module-level cache
+
+
+def _centroid_hz_to_cutoff(centroid_hz: float, sr: int) -> float:
+    """Map spectral centroid (Hz) → OB-Xf Filter Cutoff [0, 1].
+
+    Uses measured calibration from calibrate_synth.py when available;
+    falls back to heuristic linear approximation otherwise.
+    """
+    global _FILTER_CALIB_TA
+    if _FILTER_CALIB_TA is None:
+        calib_path = _Path(__file__).parent.parent / "s07_refine" / "obxf_calibration.npz"
+        if calib_path.exists():
+            d = np.load(calib_path)
+            _FILTER_CALIB_TA = {
+                "hz":   d["filter_cutoff_centroids_hz"].astype(np.float64),
+                "vals": d["filter_cutoff_values"].astype(np.float64),
+            }
+    if _FILTER_CALIB_TA is not None:
+        return float(np.clip(
+            np.interp(centroid_hz, _FILTER_CALIB_TA["hz"], _FILTER_CALIB_TA["vals"]),
+            0.0, 1.0,
+        ))
+    centroid_norm = float(np.clip(centroid_hz / (sr / 2), 0.0, 1.0))
+    return float(np.clip(0.3 + centroid_norm * 0.6, 0.3, 0.95))
+
 
 def _detect_fundamental_hps(audio: np.ndarray, sr: int) -> Optional[float]:
     """Harmonic Product Spectrum F0 estimate with sub-harmonic disambiguation.
@@ -584,6 +862,13 @@ def print_analysis(a: TargetAnalysis) -> None:
     print(f"     Stable pitch        {a.pitch_is_stable}")
     print(f"     Cross Modulation    {a.cross_mod_est:.2f}")
     print(f"     Osc 2 Detune        {a.osc2_detune_est:.2f}  (0.5=unison)")
+    print(f"  CREPE/DDSP analysis (f0_source={a.f0_source}):")
+    print(f"     Noise Volume est    {a.noise_volume_est:.3f}  → Noise Volume")
+    print(f"     Harmonic richness   {a.harmonic_richness:.3f}  → Osc 2 Volume {a.harmonic_richness*0.4:.2f}")
+    print(f"     Harmonic slope res  {a.harmonic_slope_resonance:.3f}  → Filter Resonance")
+    print(f"     Filter Env Attack   {a.filter_env_attack_est:.3f}")
+    print(f"     Filter Env Decay    {a.filter_env_decay_est:.3f}")
+    print(f"     Filter Env Sustain  {a.filter_env_sustain_est:.3f}")
     if a.notes:
         print("  Notes:")
         for n in a.notes:

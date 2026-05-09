@@ -171,7 +171,9 @@ S06b and S07 are two distinct stages that run in sequence. Understanding the dif
 
 **S06b** uses gradient descent through the frozen surrogate — fast because it avoids the VST entirely during search. Pitch is tracked using pyworld F0 (5ms resolution, full-audio, deterministic) with an autocorrelation fallback. Fine pitch glides are written as MIDI pitch bend automation (affecting all oscillators simultaneously), not Osc 1 Pitch VST automation. S06b also runs an α-refinement loop that scales the surrogate's suggested direction by testing a handful of real renders, dropping from ~0.21 to ~0.10.
 
-**S07** abandons the surrogate and evaluates every candidate by rendering through OB-Xf. S07 Strategy 1 (hill-climb) does per-param coordinate descent. S07 Strategy 2 (CMA-ES) scouts oscillator waveform configurations, runs a population-based search across an **expanded 22-parameter space** (15 surrogate params + 7 extra: Filter Env ADSR, Osc 2 Volume, Amp Env Sustain, Unison Detune), and scores each candidate using a composite distance: **EnCodec 50% + MRSTFT 30% + aperiodicity 20%**.
+**S07** abandons the surrogate and evaluates every candidate by rendering through OB-Xf. S07 Strategy 1 (hill-climb) does per-param coordinate descent. S07 Strategy 2 (CMA-ES) scouts oscillator waveform configurations **and Osc 2 Pitch intervals** (7 discrete musical intervals: octave down through octave up), then runs a population-based search across an **expanded 22-parameter space** (15 surrogate params + 7 extra: Filter Env ADSR, Osc 2 Volume, Amp Env Sustain, Unison Detune), and scores each candidate using a composite distance: **EnCodec 50% + auraloss MRSTFT 25% + aperiodicity 20% + SP 5%**, all LUFS-normalised to −23 LUFS before comparison.
+
+Per-frame **Filter Cutoff** is driven by a measured calibration curve (OB-Xf sweep: 420 Hz at cutoff=0 → 4134 Hz at cutoff=1), replacing the previous heuristic Nyquist-normalised formula. Ring Mod and Cross Modulation are smoothed with a 350ms window (7 frames) after CMA-ES to prevent high-frequency aliasing at region boundaries. The CMA-ES checkpoint writes `rendered.wav` at each IPOP restart improvement so progress is audible during the search.
 
 CMA-ES operates in three modes:
 - **`global`** (fastest): single CMA-ES pass applying global per-param offsets. Achieved **0.029** on crane scream.
@@ -212,12 +214,22 @@ Runs target analysis (spectral centroid, ADSR estimation, harmonic ratio, LFO de
 
 CMA-ES tuning flags:
 
-| Flag | Default | Effect |
+| Flag | Default | Purpose | Trade-off |
+|---|---|---|---|
+| `--cmaes-mode` | `hybrid` | `global` (fastest, best score), `per-region` (experimental), `hybrid` (global then per-region fine-tune) | `global` achieved 0.029; `hybrid` is safer for complex multi-region targets |
+| `--cmaes-sigma0` | 0.08 | Search radius around x0 | 0.05 = refine near warm-start; 0.12 = explore widely; too large wastes budget on bad regions |
+| `--cmaes-popsize` | 16 | Candidates evaluated per iteration | Larger = better coverage but proportionally more renders; 24 gives ~50% more renders per iteration |
+| `--cmaes-maxiter` | 20 | Max CMA-ES iterations before IPOP restart | 30 recommended when combined with interval scouting; adds ~5 min but aids convergence |
+
+**Recommended quality ladder** (crane scream baseline):
+
+| Command | Time | Score |
 |---|---|---|
-| `--cmaes-mode` | `hybrid` | `global` / `per-region` / `hybrid` |
-| `--cmaes-sigma0` | 0.08 | Search radius: 0.05=refine, 0.12=explore |
-| `--cmaes-popsize` | 16 | Population per iteration |
-| `--cmaes-maxiter` | 20 | Max iterations before restart |
+| `--hill-iterations 0` | ~30s | ~0.17 |
+| *(default)* | ~5 min | ~0.15 |
+| `--cmaes` | ~15 min | ~0.09–0.13 |
+| `--cmaes --cmaes-maxiter 30` | ~20 min | ~0.05–0.09 |
+| `--cmaes --cmaes-popsize 24 --cmaes-maxiter 30` | ~30 min | best quality |
 
 Output files per run: `stream_params.parquet`, `pitch_trajectory.yaml`, `fine_pitch_trajectory.yaml`, `pitch_bend.mid`, `best_patch.yaml`, `rendered.wav`, `rendered_normalized.wav`, `hill_climb_log.yaml` (if hill-climb ran), `cmaes_log.yaml` (if CMA-ES ran).
 
@@ -418,6 +430,10 @@ stream_params.parquet (from S06b)
     │  osc config scouting: saw / pulse / saw+pulse × short CMA-ES        │
     │  → best config (saw+pulse won on crane scream)                       │
     │                                                                      │
+    │  Osc 2 interval scouting: 7 discrete intervals (oct-dn / 5th-dn /  │
+    │      3rd-dn / unison / 3rd-up / 5th-up / oct-up) × short CMA-ES    │
+    │  → winning interval pinned for main CMA-ES                          │
+    │                                                                      │
     │  CMA-ES mode (hybrid default):                                       │
     │    Phase 1 — global: single pass over all frames (fast, ~0.029)    │
     │    Phase 2 — per-region: fine-tune regions ≥ 400ms where it        │
@@ -445,8 +461,8 @@ The current pipeline produces a recognizable approximation of the source: correc
 
 The surrogate was trained on static single-note patches. The most impactful changes require no retraining:
 
-- **Per-frame Filter Cutoff automation** from spectral centroid trajectory. Currently Filter Cutoff is a static parameter. Sweeping it from near-open to near-closed following the source's spectral centroid over the note duration is the single change most likely to remove the "static" character.
-- **Oscillator interval snapping** — treat Osc 2 Pitch as a discrete outer loop (unison, +3st, +7st, +12st) rather than a continuous CMA-ES parameter. Richer harmonic structure for essentially no extra renders.
+- ~~**Per-frame Filter Cutoff automation**~~ **Done.** pyworld SP + librosa centroid → per-frame trajectory written to `stream_params.parquet`, with crossfade at note boundaries.
+- ~~**Oscillator interval snapping**~~ **Done.** `_scout_osc2_intervals` in `vst_cmaes.py` tries 7 discrete intervals (oct-dn through oct-up) before the main CMA-ES; winner is pinned.
 - **Unison voices** — Unison Detune at 0.2–0.4 immediately makes any patch sound denser. Should be near-default, not CMA-ES-discovered.
 - **Noise burst at attack** — route noise through a fast-decay envelope (short Filter Env Decay at high Filter Env Amount). Gives the percussive "click" at note onset most organic sounds have.
 
@@ -473,7 +489,7 @@ The current `target_analysis.py` answers 5 heuristic design questions. Grounding
 
 ### Offline synth calibration
 
-One-time parameter sweeps through OB-Xf (Filter Cutoff 0→1 while measuring spectral centroid; Resonance 0→1 while measuring peak Q; LFO Rate 0→1 while measuring LFO Hz) would replace the current "guess and score" approach with a lookup table: "source has spectral centroid at 800Hz → set Filter Cutoff to 0.38."
+~~One-time parameter sweeps through OB-Xf~~ **Done.** `calibrate_synth.py` sweeps Filter Cutoff 0→1 and writes `s07_refine/obxf_calibration.npz`. Both `_centroid_hz_to_filter_cutoff` (stream_invert.py) and `target_analysis.py` now load this table via `np.interp`. Run once after installing the plugin: `conda run -n mimic-synth python calibrate_synth.py`
 
 ---
 

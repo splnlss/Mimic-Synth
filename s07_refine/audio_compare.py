@@ -44,14 +44,41 @@ _MRSTFT_LOSS = _auraf.MultiResolutionSTFTLoss(
 )
 _MRSTFT_LOSS.eval()
 
+_TARGET_LUFS: float = -23.0
+
+
+def _lufs_normalize(audio: np.ndarray, sr: int) -> np.ndarray:
+    """Normalize audio to -23 LUFS (ITU-R BS.1770) via pyloudnorm.
+
+    Returns the input unchanged when pyloudnorm is unavailable, the signal
+    is effectively silent (integrated loudness < -70 LUFS), or measurement
+    fails (e.g. clip shorter than 400ms gating window).
+    """
+    try:
+        import pyloudnorm as pyln
+    except ImportError:
+        return audio
+    try:
+        meter = pyln.Meter(int(sr))
+        loudness = meter.integrated_loudness(audio.astype(np.float64))
+        if not np.isfinite(loudness) or loudness < -70.0:
+            return audio
+        return pyln.normalize.loudness(
+            audio.astype(np.float64), loudness, _TARGET_LUFS
+        ).astype(np.float32)
+    except Exception:
+        return audio
+
+
 # Composite scoring weights.
 # EnCodec: high-level timbre color and resonance.
 # MRSTFT: temporal spectral variation — filter sweeps, attack/release character.
 # AP (aperiodicity): noise-vs-harmonic balance — "squaky", breathy, inharmonic content.
 # When a term is unavailable (e.g. pyworld not installed), weights are renormalised.
-ENCODEC_WEIGHT: float = 0.50
-MRSTFT_WEIGHT: float = 0.30
-AP_WEIGHT: float = 0.20
+ENCODEC_WEIGHT: float = 0.40  # roadmap §III.A revised weights
+MRSTFT_WEIGHT:  float = 0.25
+AP_WEIGHT:      float = 0.20
+SP_WEIGHT:      float = 0.15  # per-frame spectral envelope (pyworld CheapTrick)
 
 
 _MRSTFT_N_TERMS = 2 * len([256, 512, 1024, 2048])  # SpectralConvergence + LogMagnitude per scale = 8
@@ -112,6 +139,47 @@ def compute_ap_features(audio: np.ndarray, sr: int) -> np.ndarray | None:
     return np.concatenate([ap_mean, ap_std]).astype(np.float32)
 
 
+def compute_sp_features(audio: np.ndarray, sr: int) -> np.ndarray | None:
+    """Per-frame spectral envelope via pyworld CheapTrick (roadmap §II.A, §III.A).
+
+    Returns float32 array [n_frames, fft//2+1], or None when pyworld is
+    unavailable, audio is too short (< 100ms), or analysis fails.
+    """
+    try:
+        import pyworld as pw
+    except ImportError:
+        return None
+    if len(audio) < int(sr * 0.10):
+        return None
+    try:
+        audio64 = audio.astype(np.float64)
+        f0, t = pw.dio(audio64, sr)
+        f0 = pw.stonemask(audio64, f0, t, sr)
+        sp = pw.cheaptrick(audio64, f0, t, sr)   # [n_frames, fft//2+1]
+        if sp.shape[0] == 0:
+            return None
+        return sp.astype(np.float32)
+    except Exception:
+        return None
+
+
+def _sp_dist(sp_a: np.ndarray, sp_b: np.ndarray) -> float:
+    """Mean per-frame cosine distance between two SP matrices (roadmap §III.A).
+
+    score_sp = mean(cosine_dist(SP_source[t], SP_render[t])).
+    Uses the shorter frame count. Returns 1.0 (neutral) for empty inputs.
+    """
+    n = min(len(sp_a), len(sp_b))
+    if n == 0:
+        return 1.0
+    a = torch.tensor(sp_a[:n], dtype=torch.float32)
+    b = torch.tensor(sp_b[:n], dtype=torch.float32)
+    norms_a = a.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    norms_b = b.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    cos_sim = ((a / norms_a) * (b / norms_b)).sum(dim=1)
+    return float((1.0 - cos_sim).mean())
+
+
 def _cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine distance in [0, 2]. Returns 1.0 (neutral) for near-zero vectors."""
     ta = torch.tensor(a, dtype=torch.float32)
@@ -129,18 +197,22 @@ def score_audio_composite(
     device: str,
     target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
+    target_sp: np.ndarray | None = None,
 ) -> float:
-    """Composite score: EnCodec + MRSTFT + AP (aperiodicity), renormalised.
+    """Composite score: EnCodec + MRSTFT + AP + SP, renormalised (roadmap §III.A).
 
     Active terms and their base weights:
-        EnCodec  50%  — high-level timbral color and resonance
-        MRSTFT   30%  — filter movement, temporal spectral variation (auraloss)
+        EnCodec  40%  — high-level timbral color and resonance
+        MRSTFT   25%  — filter movement, temporal spectral variation (auraloss)
         AP       20%  — noise-vs-harmonic balance (squaky, breathy quality)
+        SP       15%  — per-frame spectral envelope match (pyworld CheapTrick)
 
-    Inactive terms (None) are dropped and the remaining weights are
-    renormalised so the score always has a consistent scale ∈ [0, 2].
+    Inactive terms (None) are dropped and remaining weights are renormalised
+    so the score always has a consistent scale ∈ [0, 2].
+    Both candidate and target are LUFS-normalised to -23 before comparison.
     """
-    enc_dist = score_audio(audio, sr, target_emb_t, embedder, device)
+    audio = _lufs_normalize(audio, sr)
+    enc_dist = _embed_dist(audio, sr, target_emb_t, embedder, device)
     terms: list[tuple[float, float]] = [(ENCODEC_WEIGHT, enc_dist)]
 
     if target_mrstft_audio is not None:
@@ -150,6 +222,11 @@ def score_audio_composite(
         cand_ap = compute_ap_features(audio, sr)
         if cand_ap is not None:
             terms.append((AP_WEIGHT, _cosine_dist(target_ap, cand_ap)))
+
+    if target_sp is not None:
+        cand_sp = compute_sp_features(audio, sr)
+        if cand_sp is not None:
+            terms.append((SP_WEIGHT, _sp_dist(target_sp, cand_sp)))
 
     total_w = sum(w for w, _ in terms)
     return sum(w / total_w * d for w, d in terms)
@@ -320,6 +397,21 @@ def render_region(
     return audio[:n_region].astype(np.float32), sr
 
 
+def _embed_dist(
+    audio: np.ndarray,
+    sr: int,
+    target_emb_t: torch.Tensor,
+    embedder,
+    device: str,
+) -> float:
+    """Inner EnCodec cosine distance — caller must pre-normalise audio."""
+    emb = embedder.encodec_embed(audio, sr, pool="mean")
+    emb_t = torch.tensor(emb, dtype=torch.float32, device=device)
+    return (
+        1.0 - F.cosine_similarity(emb_t.unsqueeze(0), target_emb_t.unsqueeze(0))
+    ).item()
+
+
 def score_audio(
     audio: np.ndarray,
     sr: int,
@@ -330,13 +422,11 @@ def score_audio(
     """Cosine distance between `audio`'s EnCodec embedding and `target_emb_t`.
 
     target_emb_t must already be on `device`. Returns a Python float in
-    [0, 2] (cosine *distance*, not similarity).
+    [0, 2] (cosine *distance*, not similarity). Audio is LUFS-normalised
+    before embedding so level differences don't inflate the distance.
     """
-    emb = embedder.encodec_embed(audio, sr, pool="mean")
-    emb_t = torch.tensor(emb, dtype=torch.float32, device=device)
-    return (
-        1.0 - F.cosine_similarity(emb_t.unsqueeze(0), target_emb_t.unsqueeze(0))
-    ).item()
+    audio = _lufs_normalize(audio, sr)
+    return _embed_dist(audio, sr, target_emb_t, embedder, device)
 
 
 def render_region_and_score(
@@ -350,12 +440,13 @@ def render_region_and_score(
     extra_params: dict[str, float] | None = None,
     target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
+    target_sp: np.ndarray | None = None,
 ) -> float:
-    """Render a region and return composite distance (EnCodec + MRSTFT + AP)."""
+    """Render a region and return composite distance (EnCodec + MRSTFT + AP + SP)."""
     audio, sr = render_region(params, note, region_dur, profile_path,
                               extra_params=extra_params)
     return score_audio_composite(audio, sr, target_emb_t, embedder, device,
-                                 target_mrstft_audio, target_ap)
+                                 target_mrstft_audio, target_ap, target_sp)
 
 
 def render_and_score(
@@ -370,11 +461,12 @@ def render_and_score(
     extra_params: dict[str, float] | None = None,
     target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
+    target_sp: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """Convenience: render `df` and return (score, audio)."""
     audio, sr = render_trajectory(
         df, note_regions, param_cols, profile_path, total_sec, extra_params
     )
     score = score_audio_composite(audio, sr, target_emb_t, embedder, device,
-                                  target_mrstft_audio, target_ap)
+                                  target_mrstft_audio, target_ap, target_sp)
     return score, audio

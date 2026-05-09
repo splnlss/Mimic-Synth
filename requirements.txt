@@ -10,3 +10,8 @@ pytest
 torch
 encodec
 auraloss
+pyloudnorm>=0.2.0
+torchcrepe>=0.0.24
+# acids-ircam/ddsp_pytorch: NOT pip-installable (no setup.py/pyproject.toml in repo).
+# To use: git clone https://github.com/acids-ircam/ddsp_pytorch && add to sys.path.
+# Encoder training requires s02_capture completion (§IV.B blocked). Deferred.

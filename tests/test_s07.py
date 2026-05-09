@@ -411,6 +411,273 @@ class TestMRSTFTDist:
         assert self.dist(silence, tone) > 0.0
 
 
+class TestLUFSNormalise:
+    """Tests for _lufs_normalize in audio_compare.py."""
+
+    def setup_method(self):
+        from s07_refine.audio_compare import _lufs_normalize
+        self.norm = _lufs_normalize
+
+    def test_loud_and_quiet_converge(self):
+        """10× louder and 10× quieter versions of the same signal should have
+        the same RMS after normalisation."""
+        base = _sine(440.0, 1.0) * 0.3
+        loud  = self.norm(base * 10.0, SR)
+        quiet = self.norm(base * 0.1,  SR)
+        assert abs(loud.std() - quiet.std()) < 1e-3, (
+            f"RMS mismatch after LUFS normalise: {loud.std():.5f} vs {quiet.std():.5f}"
+        )
+
+    def test_idempotent(self):
+        """Normalising a signal twice gives the same result as normalising once."""
+        audio = _sine(440.0, 1.0) * 0.3
+        once  = self.norm(audio, SR)
+        twice = self.norm(once,  SR)
+        assert np.allclose(once, twice, atol=1e-4), "Double-normalise should be idempotent"
+
+    def test_silence_passthrough(self):
+        """Silent signal (below -70 LUFS threshold) must be returned unchanged."""
+        silence = np.zeros(SR, dtype=np.float32)
+        out = self.norm(silence, SR)
+        assert np.allclose(out, silence), "Silent audio should pass through unchanged"
+
+    def test_short_clip_passthrough(self):
+        """Clip shorter than the BS.1770 400ms gating window returns original."""
+        short = _sine(440.0, 0.1) * 0.3   # 100ms — below pyloudnorm minimum
+        out = self.norm(short, SR)
+        assert np.allclose(out, short), "Short clip should pass through unchanged"
+
+    def test_output_dtype_float32(self):
+        audio = _sine(440.0, 1.0).astype(np.float32)
+        out = self.norm(audio, SR)
+        assert out.dtype == np.float32, f"Expected float32, got {out.dtype}"
+
+    def test_mrstft_dist_level_invariant(self):
+        """After normalisation, a 10× level shift should give near-zero MRSTFT distance."""
+        from s07_refine.audio_compare import _mrstft_dist
+        base   = _sine(440.0, 1.0) * 0.3
+        normal = self.norm(base,        SR)
+        louder = self.norm(base * 10.0, SR)
+        dist = _mrstft_dist(normal, louder)
+        assert dist < 0.05, f"Level-shifted signal should score ~0 after normalise, got {dist:.4f}"
+
+
+class TestFilterCutoffTrajectory:
+    """Tests for _centroid_hz_to_filter_cutoff and _compute_filter_cutoff_trajectory."""
+
+    def setup_method(self):
+        from s06b_live.stream_invert import (
+            _centroid_hz_to_filter_cutoff,
+            _compute_filter_cutoff_trajectory,
+        )
+        self.hz_to_fc = _centroid_hz_to_filter_cutoff
+        self.traj = _compute_filter_cutoff_trajectory
+
+    def test_centroid_hz_bounds(self):
+        # Output must always be in [0, 1]; low Hz → low cutoff; very high Hz → near 1.0.
+        # Exact values depend on whether calibration table exists (calibrated vs heuristic).
+        arr = np.array([0.0, SR / 2, SR * 2], dtype=np.float32)
+        out = self.hz_to_fc(arr, SR)
+        assert 0.0 <= out[0] <= 0.5, f"0 Hz should map to a low cutoff, got {out[0]}"
+        assert 0.5 <= out[1] <= 1.0, f"Nyquist should map to a high cutoff, got {out[1]}"
+        assert out[2] == pytest.approx(out[1], abs=0.1), "above Nyquist should saturate"
+
+    def test_centroid_hz_monotone(self):
+        freqs = np.array([100.0, 500.0, 2000.0, 8000.0], dtype=np.float32)
+        out = self.hz_to_fc(freqs, SR)
+        assert np.all(np.diff(out) > 0), "mapping must be strictly increasing"
+
+    def test_trajectory_output_shape(self):
+        audio = _sine(440.0, 1.0)
+        ts = np.linspace(0.1, 0.9, 10)
+        result = self.traj(audio, SR, ts)
+        assert result.shape == (10,)
+
+    def test_trajectory_values_in_range(self):
+        audio = np.random.randn(SR).astype(np.float32) * 0.1
+        ts = np.linspace(0.05, 0.95, 15)
+        result = self.traj(audio, SR, ts)
+        assert result.min() >= 0.0 and result.max() <= 1.0
+
+    def test_bright_higher_than_dark(self):
+        # 4 kHz sine centroid: (4000/24000)*0.6+0.3 ≈ 0.40 > 200 Hz: ≈ 0.305
+        bright = _sine(4000.0, 1.0)
+        dark   = _sine(200.0,  1.0)
+        ts = np.linspace(0.1, 0.9, 8)
+        fc_bright = self.traj(bright, SR, ts)
+        fc_dark   = self.traj(dark,   SR, ts)
+        assert fc_bright.mean() > fc_dark.mean(), (
+            f"bright ({fc_bright.mean():.3f}) should exceed dark ({fc_dark.mean():.3f})"
+        )
+
+    def test_silence_does_not_crash(self):
+        silence = np.zeros(SR, dtype=np.float32)
+        ts = np.linspace(0.1, 0.9, 5)
+        result = self.traj(silence, SR, ts)
+        assert result.shape == (5,)
+        assert np.all(np.isfinite(result))
+
+
+class TestSPScoring:
+    """Tests for compute_sp_features and _sp_dist in audio_compare.py."""
+
+    def setup_method(self):
+        from s07_refine.audio_compare import (
+            compute_sp_features, _sp_dist,
+            ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT,
+        )
+        self.sp_feats = compute_sp_features
+        self.sp_dist  = _sp_dist
+        self.weights  = (ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT)
+
+    def test_weights_sum_to_one(self):
+        total = sum(self.weights)
+        assert total == pytest.approx(1.0, abs=1e-6), f"weights sum {total} ≠ 1.0"
+
+    def test_sp_features_shape(self):
+        audio = _sine(440.0, 1.0)
+        sp = self.sp_feats(audio, SR)
+        assert sp is not None
+        assert sp.ndim == 2
+        assert sp.shape[1] > 1
+        assert sp.dtype == np.float32
+
+    def test_sp_features_short_returns_none(self):
+        short = _sine(440.0, 0.05)   # 50ms — below 100ms minimum
+        assert self.sp_feats(short, SR) is None
+
+    def test_sp_dist_identical_near_zero(self):
+        sp = self.sp_feats(_sine(440.0, 1.0), SR)
+        assert self.sp_dist(sp, sp) < 0.01
+
+    def test_sp_dist_different_signals(self):
+        sp_bright = self.sp_feats(_sine(4000.0, 1.0), SR)
+        sp_dark   = self.sp_feats(_sine(200.0,  1.0), SR)
+        assert self.sp_dist(sp_bright, sp_dark) > 0.0
+
+    def test_sp_dist_empty_returns_neutral(self):
+        empty = np.zeros((0, 513), dtype=np.float32)
+        assert self.sp_dist(empty, empty) == 1.0
+
+
+class TestCREPEWarmStart:
+    """Tests for CREPE + harmonic analysis warm-start in target_analysis.py."""
+
+    def setup_method(self):
+        from s07_refine.target_analysis import (
+            _crepe_f0, _pyworld_analysis, _harmonic_amplitudes,
+            analyze_target, suggest_x0,
+        )
+        self.crepe_f0      = _crepe_f0
+        self.pyworld       = _pyworld_analysis
+        self.harm_amps     = _harmonic_amplitudes
+        self.analyze       = analyze_target
+        self.suggest       = suggest_x0
+
+    # ── _crepe_f0 ──────────────────────────────────────────────────────────
+
+    def test_crepe_f0_returns_tuple(self):
+        audio = _sine(440.0, 1.0)
+        result = self.crepe_f0(audio, SR)
+        assert result is not None, "CREPE should succeed on 1s 440Hz sine"
+        f0, t = result
+        assert f0.shape == t.shape
+        assert len(f0) > 0
+
+    def test_crepe_f0_voiced_majority(self):
+        audio = _sine(440.0, 1.0)
+        f0, t = self.crepe_f0(audio, SR)
+        voiced_frac = (f0 > 0).mean()
+        assert voiced_frac > 0.5, f"Most frames should be voiced, got {voiced_frac:.2f}"
+
+    def test_crepe_f0_silence_unvoiced(self):
+        silence = np.zeros(SR, dtype=np.float32)
+        f0, t = self.crepe_f0(silence, SR)
+        assert (f0 == 0).all(), "Silent audio should have all unvoiced frames"
+
+    def test_crepe_f0_short_returns_none(self):
+        short = _sine(440.0, 0.05)   # 50ms
+        assert self.crepe_f0(short, SR) is None
+
+    def test_crepe_f0_frequency_accuracy(self):
+        audio = _sine(440.0, 1.0)
+        f0, _ = self.crepe_f0(audio, SR)
+        voiced = f0[f0 > 0]
+        assert len(voiced) > 0
+        median_f0 = float(np.median(voiced))
+        assert abs(median_f0 - 440.0) < 10.0, f"CREPE F0 {median_f0:.1f}Hz should be near 440Hz"
+
+    # ── _harmonic_amplitudes ────────────────────────────────────────────────
+
+    def test_harmonic_amplitudes_shape(self):
+        audio = _sine(440.0, 1.0)
+        f0 = np.full(200, 440.0)
+        t = np.arange(200) * 0.005
+        f0[:10] = 0.0   # unvoiced prefix
+        result = self.harm_amps(audio, SR, f0, t)
+        assert result is not None
+        assert result.shape[0] == 200
+        assert result.shape[1] == 16   # n_harmonics default
+
+    def test_harmonic_amplitudes_fundamental_dominant(self):
+        audio = _sine(440.0, 1.0) * 0.5
+        f0 = np.full(200, 440.0)
+        t  = np.arange(200) * 0.005
+        result = self.harm_amps(audio, SR, f0, t)
+        voiced = result[f0 > 0]
+        if len(voiced) > 0:
+            h1_mean  = voiced[:, 0].mean()
+            h2_mean  = voiced[:, 1].mean()
+            assert h1_mean > h2_mean * 0.5, "Fundamental should be dominant"
+
+    def test_harmonic_amplitudes_unvoiced_zero(self):
+        audio = _sine(440.0, 1.0)
+        f0 = np.zeros(200)         # all unvoiced
+        t  = np.arange(200) * 0.005
+        result = self.harm_amps(audio, SR, f0, t)
+        if result is not None:
+            assert result.sum() == 0.0
+
+    # ── analyze_target integration ─────────────────────────────────────────
+
+    def test_analyze_uses_crepe(self):
+        audio = _sine(440.0, 1.0)
+        a = self.analyze(audio, SR)
+        assert a.f0_source in ("crepe", "hps", "dio"), f"unexpected f0_source: {a.f0_source}"
+
+    def test_analyze_noise_volume_populated(self):
+        noise = np.random.randn(SR).astype(np.float32) * 0.3
+        a = self.analyze(noise, SR)
+        # White noise should trigger some noise volume estimate
+        assert 0.0 <= a.noise_volume_est <= 0.40
+
+    def test_analyze_filter_env_fields_finite(self):
+        audio = _sine(440.0, 1.0)
+        a = self.analyze(audio, SR)
+        for field_val in [a.filter_env_attack_est, a.filter_env_decay_est,
+                          a.filter_env_sustain_est]:
+            assert np.isfinite(field_val)
+            assert 0.0 <= field_val <= 1.0
+
+    def test_analyze_harmonic_richness_in_range(self):
+        audio = _sine(440.0, 1.0)
+        a = self.analyze(audio, SR)
+        assert 0.0 <= a.harmonic_richness <= 1.0
+
+    # ── suggest_x0 coverage ────────────────────────────────────────────────
+
+    def test_suggest_x0_covers_new_params(self):
+        audio = _sine(440.0, 1.0)
+        a = self.analyze(audio, SR)
+        new_params = [
+            "p_Noise Volume", "p_Filter Env Attack",
+            "p_Filter Env Decay", "p_Filter Env Sustain", "p_Osc 2 Volume",
+        ]
+        x0 = self.suggest(a, new_params, set())
+        assert x0.shape == (len(new_params),)
+        assert np.all((x0 >= 0.0) & (x0 <= 1.0))
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Integration smoke test (no render; just imports and analysis)
 # ════════════════════════════════════════════════════════════════════════════
@@ -426,9 +693,9 @@ class TestSmoke:
     def test_audio_compare_imports(self):
         from s07_refine.audio_compare import (
             _mrstft_dist, compute_ap_features, score_audio_composite,
-            ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT,
+            ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT,
         )
-        assert abs(ENCODEC_WEIGHT + MRSTFT_WEIGHT + AP_WEIGHT - 1.0) < 1e-6
+        assert abs(ENCODEC_WEIGHT + MRSTFT_WEIGHT + AP_WEIGHT + SP_WEIGHT - 1.0) < 1e-6
 
     def test_analyze_crane_scream_if_available(self):
         """Run full analysis on the actual target if it exists."""

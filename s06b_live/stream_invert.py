@@ -388,6 +388,110 @@ def _write_pitch_bend_midi(
     return pb_range_param
 
 
+_FILTER_CALIB: dict | None = None   # module-level cache; loaded once on first call
+
+
+def _centroid_hz_to_filter_cutoff(centroid_hz: np.ndarray, sr: int) -> np.ndarray:
+    """Map spectral centroid Hz → OB-Xf Filter Cutoff [0, 1].
+
+    Uses the measured calibration table from calibrate_synth.py when available;
+    falls back to heuristic linear approximation otherwise.
+    """
+    global _FILTER_CALIB
+    if _FILTER_CALIB is None:
+        calib_path = Path(__file__).parent.parent / "s07_refine" / "obxf_calibration.npz"
+        if calib_path.exists():
+            d = np.load(calib_path)
+            _FILTER_CALIB = {
+                "hz":   d["filter_cutoff_centroids_hz"].astype(np.float64),
+                "vals": d["filter_cutoff_values"].astype(np.float64),
+            }
+    if _FILTER_CALIB is not None:
+        return np.clip(
+            np.interp(centroid_hz, _FILTER_CALIB["hz"], _FILTER_CALIB["vals"]),
+            0.0, 1.0,
+        )
+    # Fallback heuristic (no calibration file)
+    centroid_norm = np.clip(centroid_hz / (sr / 2), 0.0, 1.0)
+    return np.clip(0.3 + centroid_norm * 0.6, 0.3, 0.95)
+
+
+def _compute_filter_cutoff_trajectory(
+    audio: np.ndarray,
+    sr: int,
+    timestamps: np.ndarray,
+    smooth_window: int = 3,
+) -> np.ndarray:
+    """Per-frame Filter Cutoff trajectory from pyworld SP + librosa centroid.
+
+    For voiced frames uses CheapTrick spectral envelope centroid (roadmap §II.A).
+    For unvoiced/silence falls back to librosa.feature.spectral_centroid.
+    Maps Hz → [0.30, 0.95] via _centroid_hz_to_filter_cutoff, then interpolates
+    to the surrogate `timestamps` (50ms hop) and smooths.
+
+    Returns float32 array of shape [len(timestamps)] in [0, 1].
+    """
+    import librosa
+    try:
+        import pyworld as pw
+        _PW_AVAILABLE = True
+    except ImportError:
+        _PW_AVAILABLE = False
+
+    # Librosa centroid — works for all frames including unvoiced
+    hop_lib = max(1, int(sr * 0.010))   # 10ms
+    centroid_lib_arr = librosa.feature.spectral_centroid(
+        y=audio, sr=sr, hop_length=hop_lib
+    )[0]                                                        # [n_lib], Hz
+    lib_t = librosa.frames_to_time(
+        np.arange(len(centroid_lib_arr)), sr=sr, hop_length=hop_lib
+    )
+    # Guard NaN/zero from silent frames
+    valid_lib = centroid_lib_arr > 0
+    if valid_lib.any():
+        fallback_hz = float(np.nanmedian(centroid_lib_arr[valid_lib]))
+    else:
+        fallback_hz = float(sr) / 8.0
+    centroid_lib_arr = np.where(valid_lib, centroid_lib_arr, fallback_hz)
+
+    if not _PW_AVAILABLE or len(audio) < int(sr * 0.10):
+        # Fallback: librosa only
+        fc_lib = _centroid_hz_to_filter_cutoff(centroid_lib_arr, sr)
+        fc_traj = np.interp(timestamps, lib_t, fc_lib)
+        return np.clip(smooth_trajectory(fc_traj, smooth_window), 0.0, 1.0)
+
+    try:
+        audio64 = audio.astype(np.float64)
+        f0, pw_t = pw.dio(audio64, sr)
+        f0 = pw.stonemask(audio64, f0, pw_t, sr)
+        sp = pw.cheaptrick(audio64, f0, pw_t, sr)              # [n_pw, fft//2+1]
+        if sp.shape[0] == 0:
+            raise ValueError("empty SP")
+
+        freqs = np.linspace(0.0, sr / 2.0, sp.shape[1])
+        sp_power = sp.sum(axis=1)
+        safe_power = np.where(sp_power > 0, sp_power, 1.0)
+        centroid_sp = (sp * freqs[np.newaxis, :]).sum(axis=1) / safe_power  # Hz [n_pw]
+
+        voiced = f0 > 30.0
+        lib_at_pw = np.interp(pw_t, lib_t, centroid_lib_arr)
+        centroid_hybrid = np.where(voiced, centroid_sp, lib_at_pw)
+
+        # NaN/Inf from SP on degenerate frames
+        bad = ~np.isfinite(centroid_hybrid) | (centroid_hybrid <= 0)
+        centroid_hybrid = np.where(bad, lib_at_pw, centroid_hybrid)
+
+        fc_pw = _centroid_hz_to_filter_cutoff(centroid_hybrid, sr)
+        fc_traj = np.interp(timestamps, pw_t, fc_pw)
+
+    except Exception:
+        # Any pyworld failure → fall back to librosa
+        fc_lib = _centroid_hz_to_filter_cutoff(centroid_lib_arr, sr)
+        fc_traj = np.interp(timestamps, lib_t, fc_lib)
+
+    return np.clip(smooth_trajectory(fc_traj, smooth_window), 0.0, 1.0)
+
+
 def _compute_fine_pitch_trajectory(
     audio: np.ndarray,
     sr: int,
@@ -824,6 +928,32 @@ def stream_invert(
         if col in df.columns:
             df[col] = smooth_trajectory(df[col].values, smooth_window)
 
+    # ── Filter Cutoff trajectory from spectral centroid (roadmap §VII-1) ──
+    print("Computing Filter Cutoff trajectory (pyworld SP + librosa centroid)...")
+    fc_traj = _compute_filter_cutoff_trajectory(
+        audio, sr, df["timestamp"].values, smooth_window=3,
+    )
+    # Crossfade filter cutoff across note boundaries (20ms either side) so the
+    # cutoff never sits at its spectral-centroid-derived low point precisely when
+    # the filter envelope fires at note-on — that combination causes resonant ticks.
+    _ts = df["timestamp"].values
+    _hop = float(_ts[1] - _ts[0]) if len(_ts) > 1 else 0.05
+    _xfade_frames = max(1, int(round(0.020 / _hop)))   # 20ms
+    for _r in note_regions:
+        _b = _r["onset_sec"]
+        _lo = max(0, int(np.searchsorted(_ts, _b - _xfade_frames * _hop)))
+        _hi = min(len(fc_traj) - 1, int(np.searchsorted(_ts, _b + _xfade_frames * _hop)))
+        if _hi <= _lo:
+            continue
+        _v0 = fc_traj[_lo]
+        _v1 = fc_traj[_hi]
+        for _j, _idx in enumerate(range(_lo, _hi + 1)):
+            _alpha = _j / max(_hi - _lo, 1)
+            fc_traj[_idx] = (1.0 - _alpha) * _v0 + _alpha * _v1
+    df["p_Filter Cutoff"] = fc_traj
+    fc_min, fc_max = float(fc_traj.min()), float(fc_traj.max())
+    print(f"  → Filter Cutoff range: [{fc_min:.3f}, {fc_max:.3f}]  (Δ={fc_max - fc_min:.3f})")
+
     best_row = df.loc[df["score"].idxmin()]
 
     # ── Save outputs ─────────────────────────────────────────────────────
@@ -1108,12 +1238,13 @@ def _refine_loop(
     best_score = float("inf")
     best_df = df.copy()
 
-    target_emb = embedder.encodec_embed(target_audio, sr, pool="mean")
+    from s07_refine.audio_compare import compute_ap_features, compute_sp_features, score_audio_composite, _lufs_normalize
+    target_audio_norm = _lufs_normalize(target_audio, sr)
+    target_emb = embedder.encodec_embed(target_audio_norm, sr, pool="mean")
     target_emb_torch = torch.tensor(target_emb, dtype=torch.float32).to(device)
-
-    from s07_refine.audio_compare import compute_ap_features, score_audio_composite
-    target_mrstft_audio = target_audio
-    target_ap = compute_ap_features(target_audio, sr)
+    target_mrstft_audio = target_audio_norm
+    target_ap = compute_ap_features(target_audio_norm, sr)
+    target_sp = compute_sp_features(target_audio_norm, sr)
 
     def _render_and_score(current_df):
         engine = daw.RenderEngine(sr_profile, 512)
@@ -1143,7 +1274,7 @@ def _refine_loop(
 
         score = score_audio_composite(
             rendered, sr_profile, target_emb_torch, embedder, device,
-            target_mrstft_audio, target_ap,
+            target_mrstft_audio, target_ap, target_sp,
         )
         return score, rendered
 
@@ -1281,16 +1412,18 @@ def _hill_climb_step(
     them via `pinned_cols`).
     """
     from s07_refine.vst_hill_climb import hill_climb
-    from s07_refine.audio_compare import compute_ap_features
+    from s07_refine.audio_compare import compute_ap_features, compute_sp_features, _lufs_normalize
 
     target_audio, sr = sf.read(str(target_wav), dtype="float32")
     if target_audio.ndim == 2:
         target_audio = target_audio.mean(axis=1)
+    target_audio = _lufs_normalize(target_audio, int(sr))
 
     target_emb = embedder.encodec_embed(target_audio, sr, pool="mean")
     target_emb_t = torch.tensor(target_emb, dtype=torch.float32, device=device)
     target_mrstft_audio = target_audio
     target_ap = compute_ap_features(target_audio, sr)
+    target_sp = compute_sp_features(target_audio, int(sr))
 
     active = "EnCodec+MRSTFT" + ("+AP" if target_ap is not None else "")
     df = pd.read_parquet(run_dir / "stream_params.parquet")
@@ -1315,6 +1448,7 @@ def _hill_climb_step(
         n_passes=n_passes,
         target_mrstft_audio=target_mrstft_audio,
         target_ap=target_ap,
+        target_sp=target_sp,
     )
 
     # Persist updated trajectory + best patch + change log.
@@ -1413,6 +1547,21 @@ def _cmaes_step(
 
     print(f"\n=== CMA-ES refinement (mode={mode}, popsize={popsize}, maxiter={maxiter}) ===")
 
+    # Checkpoint: write rendered.wav whenever CMA-ES finds a new best score.
+    # Called by _run_global via _ipop_cmaes at each IPOP restart improvement.
+    from s07_refine.audio_compare import render_trajectory as _render_trajectory
+
+    def _cmaes_checkpoint(ckpt_df: "pd.DataFrame", score: float) -> None:
+        try:
+            audio_ckpt, sr_ckpt = _render_trajectory(
+                ckpt_df, note_regions, list(ckpt_df.columns),
+                profile_path, total_sec,
+            )
+            sf.write(str(run_dir / "rendered.wav"), audio_ckpt.T, sr_ckpt)
+            print(f"  [ckpt] CMA-ES new best {score:.4f} → rendered.wav updated")
+        except Exception as _e:
+            print(f"  [ckpt] skipped ({_e})")
+
     result = cmaes_refine(
         df=df,
         note_regions=note_regions,
@@ -1427,7 +1576,15 @@ def _cmaes_step(
         sigma0=sigma0,
         popsize=popsize,
         maxiter=maxiter,
+        on_improvement=_cmaes_checkpoint,
     )
+
+    # Smooth ring-mod params with a longer window to prevent high-freq aliasing
+    # at region boundaries (extra CMA-ES params are not covered by the surrogate smooth)
+    _SLOW_PARAMS = ["p_Ring Mod Volume", "p_Cross Modulation"]
+    for _col in _SLOW_PARAMS:
+        if _col in result.best_df.columns:
+            result.best_df[_col] = smooth_trajectory(result.best_df[_col].values, 7)
 
     # All param columns = surrogate 15 + extra 7 (now in result.best_df)
     all_param_cols = [c for c in result.best_df.columns if c.startswith("p_")]

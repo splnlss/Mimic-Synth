@@ -73,6 +73,7 @@ def hill_climb(
     verbose: bool = True,
     target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
+    target_sp: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, float, list[dict]]:
     """Run coordinate-descent hill climbing on per-param global offsets.
 
@@ -115,7 +116,7 @@ def hill_climb(
     current_score, _ = render_and_score(
         df, note_regions, param_cols, profile_path, total_sec,
         target_emb_t, embedder, device,
-        target_mrstft_audio=target_mrstft_audio, target_ap=target_ap,
+        target_mrstft_audio=target_mrstft_audio, target_ap=target_ap, target_sp=target_sp,
     )
     initial_score = current_score
     if verbose:
@@ -144,7 +145,7 @@ def hill_climb(
                 s, _ = render_and_score(
                     trial_df, note_regions, param_cols, profile_path, total_sec,
                     target_emb_t, embedder, device,
-                    target_mrstft_audio=target_mrstft_audio, target_ap=target_ap,
+                    target_mrstft_audio=target_mrstft_audio, target_ap=target_ap, target_sp=target_sp,
                 )
                 if s < best_score:
                     best_score = s
