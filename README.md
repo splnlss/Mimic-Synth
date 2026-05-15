@@ -38,6 +38,8 @@ A pipeline for building audio datasets from synthesizers and training models tha
 
 All pipeline outputs (WAVs, parquet, embeddings, model checkpoints, patches) live on an external drive — **not** in this repo. Source code stays here.
 
+Each project folder contains a `PROJECT_STATUS.md` that tracks stage completion, quality results, the active surrogate checkpoint, and next steps. That file is the source of truth for project state; this README describes the software only.
+
 Data root is configured in `defaults.py`:
 
 ```python
@@ -79,13 +81,18 @@ Lists all parameters exposed by the OB-Xf VST.
 
 ### 2. Capture raw audio (S02)
 
-Renders 2^M Sobol-sampled parameter vectors × 16 notes into the data directory. Production uses M=14 (16,384 vectors × 16 notes = 262,144 captures). All output paths come from `defaults.py` — no flags needed.
+Renders 2^M Sobol-sampled parameter vectors × N notes into the data directory (N and M are defined in the profile). All output paths come from `defaults.py` — no flags needed.
+
+> **Important:** always run capture via `conda activate` + direct python, not `conda run`. `conda run` buffers stdout and the tqdm progress bar won't appear.
 
 ```bash
+conda activate mimic-synth
 python s02_capture/capture_v1_2.py
 ```
 
 Checkpoints every 50 vectors. If interrupted, re-run — it resumes automatically (interactive: choose **[c]ontinue**; non-interactive/background: resumes without prompting).
+
+> **Fresh start:** if the profile changes (new parameters or notes), the old parquet must be deleted before restarting or old rows with NaN param values will contaminate the dataset. Delete `s02_capture/samples.parquet` and `s02_capture/wav/` before re-running.
 
 Key features (v1.2):
 - **Settle-before-patch-change**: drains the old patch's release tail before loading new parameters
@@ -144,7 +151,7 @@ Verify with a full round-trip check on the held-out test split (spec criterion: 
 python -m s05_surrogate.verify_surrogate
 ```
 
-Auto-selects the latest run in `S05_RUNS_DIR`. Current best: `run_20260429_145056` — val loss 0.0061, test-split cos-sim 0.9988 (dev-scale data; production retrain pending).
+Auto-selects the latest run in `S05_RUNS_DIR`. See the project's `PROJECT_STATUS.md` for the current checkpoint and quality metrics.
 
 ### 6. Invert a target sound (S06) ⚠️ WIP
 
@@ -171,7 +178,7 @@ S06b and S07 are two distinct stages that run in sequence. Understanding the dif
 
 **S06b** uses gradient descent through the frozen surrogate — fast because it avoids the VST entirely during search. Pitch is tracked using pyworld F0 (5ms resolution, full-audio, deterministic) with an autocorrelation fallback. Fine pitch glides are written as MIDI pitch bend automation (affecting all oscillators simultaneously), not Osc 1 Pitch VST automation. S06b also runs an α-refinement loop that scales the surrogate's suggested direction by testing a handful of real renders, dropping from ~0.21 to ~0.10.
 
-**S07** abandons the surrogate and evaluates every candidate by rendering through OB-Xf. S07 Strategy 1 (hill-climb) does per-param coordinate descent. S07 Strategy 2 (CMA-ES) scouts oscillator waveform configurations **and Osc 2 Pitch intervals** (7 discrete musical intervals: octave down through octave up), then runs a population-based search across an **expanded 22-parameter space** (15 surrogate params + 7 extra: Filter Env ADSR, Osc 2 Volume, Amp Env Sustain, Unison Detune), and scores each candidate using a composite distance: **EnCodec 50% + auraloss MRSTFT 25% + aperiodicity 20% + SP 5%**, all LUFS-normalised to −23 LUFS before comparison.
+**S07** abandons the surrogate and evaluates every candidate by rendering through the VST. S07 Strategy 1 (hill-climb) does per-param coordinate descent. S07 Strategy 2 (CMA-ES) scouts oscillator waveform configurations **and Osc 2 Pitch intervals** (7 discrete musical intervals: octave down through octave up), then runs a population-based search across the full surrogate param space plus any extra params defined in `cmaes_extra_params`, scoring each candidate with a composite distance: **EnCodec 40% + auraloss MRSTFT 25% + aperiodicity 20% + spectral envelope 15%**, all LUFS-normalised to −23 LUFS. Attack transient detection (librosa onset) sets a per-target dynamic upper bound on attack time.
 
 Per-frame **Filter Cutoff** is driven by a measured calibration curve (OB-Xf sweep: 420 Hz at cutoff=0 → 4134 Hz at cutoff=1), replacing the previous heuristic Nyquist-normalised formula. Ring Mod and Cross Modulation are smoothed with a 350ms window (7 frames) after CMA-ES to prevent high-frequency aliasing at region boundaries. The CMA-ES checkpoint writes `rendered.wav` at each IPOP restart improvement so progress is audible during the search.
 
@@ -343,7 +350,7 @@ parameters:
     importance: 1.0     # 0 = fixed at reset, 1 = full range sampled
 
 probe:
-  notes: [34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 72, 84]
+  notes: [24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84, 87, 90, 93, 96]
   velocity: 100
   hold_sec: 1.5
   release_sec: 4.5
@@ -408,7 +415,7 @@ target.wav  ──► mono conversion (auto)
 stream_params.parquet (from S06b)
                       ↓
     ┌─── Strategy 1: Hill-climb (default, ~5 min) ───────────────────────┐
-    │  score = EnCodec (50%) + MRSTFT (30%) + aperiodicity (20%)         │
+    │  score = EnCodec (40%) + MRSTFT (25%) + AP (20%) + SP (15%)        │
     │  for each unpinned param p:                                         │
     │      for offset in [-0.15, -0.05, +0.05, +0.15]:                  │
     │          trial = clip(all_frames[p] + offset, 0, 1)                │
@@ -424,8 +431,8 @@ stream_params.parquet (from S06b)
     │                   spectral flux → Filter Env Amount / LFO rate      │
     │                   → smart x0 blended with hill-climb result         │
     │                                                                      │
-    │  parameter space: 15 surrogate + 7 extra (Filter Env ADSR,         │
-    │      Osc 2 Volume, Amp Env Sustain, Unison Detune) = 22 total       │
+    │  parameter space: all surrogate params + cmaes_extra_params         │
+    │      (profile-defined bounds constrain CMA-ES search range)         │
     │                                                                      │
     │  osc config scouting: saw / pulse / saw+pulse × short CMA-ES        │
     │  → best config (saw+pulse won on crane scream)                       │
@@ -471,21 +478,21 @@ The surrogate was trained on static single-note patches. The most impactful chan
 The current `target_analysis.py` answers 5 heuristic design questions. Grounding them in signal analysis would give more reliable warm-starts:
 
 - **pyworld spectral envelope (SP)** as a direct filter target — SP is the smooth spectral shape per frame and maps directly to Filter Cutoff trajectory and Filter Resonance. Already available from `pyworld.wav2world()`, which the pipeline calls for F0/AP.
-- **Attack transient decomposition** — identify transient events (< 50ms) by onset detection, measure peak frequency and duration, constrain Amp Env Attack and Filter Env Attack directly.
+- **Attack transient decomposition** — `_detect_transient_min_ms()` in `target_analysis.py` uses librosa onset detection; the minimum inter-onset interval sets a per-target dynamic upper bound on Amp Env Attack in `cmaes_refine()`, replacing the previous static bound.
 - **Harmonic structure classification** — use pyworld aperiodicity (AP) mean to gate oscillator selection explicitly: AP < 0.2 → saw/saw+pulse, AP 0.2–0.5 → saw+pulse + noise, AP > 0.5 → noise-dominant. Currently implicit in CMA-ES scoring.
 - **Inharmonicity fingerprinting** — measure deviation of spectral peaks from integer ratios. Gives a direct objective for Ring Mod and Cross Modulation depth, which currently only emerge by accident.
 
 ### Better scoring
 
-- **Per-frame SP distance** (pyworld) as an additional scoring term: `score = 0.40×EnCodec + 0.25×MRSTFT + 0.20×AP + 0.15×SP`. Directly rewards the optimizer for matching filter movement frame-by-frame.
+- **Per-frame SP distance** — `SP_WEIGHT = 0.15` in `audio_compare.py`; composite is `0.40×EnCodec + 0.25×MRSTFT + 0.20×AP + 0.15×SP`. Directly rewards the optimizer for matching filter movement frame-by-frame.
 - **Pitch-invariant timbral scoring** — pitch-shift the render to match the source before embedding, so cosine distance measures timbre rather than penalizing small pitch errors.
-- **LUFS normalization** before all comparisons, so level differences don't bias the optimizer toward level-matched rather than timbre-matched solutions.
+- **LUFS normalization** — `_lufs_normalize()` in `audio_compare.py`; applied before all scoring comparisons.
 
 ### Better optimization
 
 - **Hierarchical search** — separate coarse (discrete: oscillator type, Osc 2 interval, ring mod on/off) from medium (ADSR set analytically from target waveform) from fine (CMA-ES on the remaining 8–10 parameters). Shrinks the effective CMA-ES search space 3–5×.
 - **DDSP analysis as CMA-ES warm-start** — Google's DDSP extracts continuous filter cutoff and harmonic amplitude trajectories analytically. Using those as x0 instead of the current target_analysis heuristics would give dramatically better convergence.
-- **Surrogate retrained on production data** — the current surrogate was trained on dev-scale data. An M=14 production retrain with extra params (Filter Env ADSR, Osc 2 Volume) in the input would improve gradient inversion quality and widen the explorable parameter space.
+- **Surrogate retrained on production data** — after capture completes, rebuild S03 → S04 → S05. The surrogate's input dimension is read directly from the profile, so adding parameters to `obxf.yaml` automatically expands the model on the next train.
 
 ### Offline synth calibration
 

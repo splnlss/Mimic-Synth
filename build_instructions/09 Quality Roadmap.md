@@ -50,7 +50,7 @@ Using the per-frame SP distance as a scoring term would reward the optimizer for
 sp = pw.cheaptrick(audio.astype(np.float64), f0, t, sr)  # [n_frames, fft//2+1]
 ap = pw.d4c(audio.astype(np.float64), f0, t, sr)         # already needed for §II.C
 ```
-No new dependency, no model training. See [pyworld docs](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder).
+No new dependency, no model tsraining. See [pyworld docs](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder).
 
 ### B. Attack transient decomposition
 The burst events at 85ms/135ms are attack transients — very short energy spikes with their own spectral character. Currently they are detected as note regions (MIDI 84 for ~100ms) but the synthesizer's attack time governs whether they sound crisp or smeared. A dedicated transient analysis stage should:
@@ -217,10 +217,10 @@ For complex, layered sounds: render two independent OB-Xf instances simultaneous
 | 1 | Per-frame Filter Cutoff automation from spectral centroid | Removes "static" character; most audible single change | Medium | ✅ Done — pyworld SP + librosa centroid → per-frame trajectory in stream_params.parquet |
 | 2 | Offline synth calibration curves | Accurate parameter → frequency mapping | Low | ✅ Done — `calibrate_synth.py`; `obxf_calibration.npz` (420→4134 Hz); used in `_centroid_hz_to_filter_cutoff` and `target_analysis` |
 | 3 | Osc 2 interval snapping (discrete octave/fifth/unison search) | Richer harmonic structure | Low | ✅ Done — `_scout_osc2_intervals` in `vst_cmaes.py`; 7 intervals scouted before main CMA-ES |
-| 4 | Spectral envelope (pyworld SP) as scoring term | Better filter matching | Medium | 🔲 Pending |
-| 5 | Attack transient constraint (Amp Env Attack < transient duration) | Correct attack character | Low | 🔲 Pending |
+| 4 | Spectral envelope (pyworld SP) as scoring term | Better filter matching | Medium | ✅ Done — `SP_WEIGHT=0.15` in `audio_compare.py`; composite is 40/25/20/15 (EnCodec/MRSTFT/AP/SP) |
+| 5 | Attack transient constraint (Amp Env Attack < transient duration) | Correct attack character | Low | ✅ Done — `_detect_transient_min_ms()` via librosa onset detection; dynamic hi_attack bound threaded into `cmaes_refine(analysis=)` |
 | 6 | DDSP analysis to initialise CMA-ES x0 | Better convergence, fewer renders | High | 🔲 Pending (blocked on trained encoder) |
-| 7 | Surrogate retrained on M=14 data with extra params | Better gradient inversion | High (blocked on S02) | 🔲 Pending |
+| 7 | Surrogate retrained on M=14 data with 30 params + 25 notes | Better gradient inversion | High (S02 ✅ complete) | 🔲 Pending — profile expanded; new capture needed |
 | 8 | Temporal surrogate (per-frame trajectories) | True dynamic synthesis | Very high | 🔲 Pending |
 | 9 | Multi-instance render | Richer layering | Medium | 🔲 Pending |
 | 10 | Learned synthesis parameter prediction (neural) | Fast inference, no CMA-ES | Very high (data-hungry) | 🔲 Pending |
@@ -241,3 +241,4 @@ For complex, layered sounds: render two independent OB-Xf instances simultaneous
 | Harmonic amplitude extraction (DDSP-style) for warm-start | ✅ Done — `_harmonic_amplitudes()` in `target_analysis.py` |
 | CMA-ES checkpoint-on-improvement (write rendered.wav at each IPOP restart) | ✅ Done — `on_improvement` callback threaded through `cmaes_refine → _run_global → _ipop_cmaes` |
 | Ring mod 350ms post-smooth to prevent 5–20kHz aliasing at region boundaries | ✅ Done — `_SLOW_PARAMS` smooth after `cmaes_refine` in `stream_invert.py` |
+| Profile expanded: 30 surrogate params (was 15) + 25 notes C1–C7 (was 16) | ✅ Done — `obxf.yaml`; adds Osc 1/2 waveforms, Noise, Filter Env ADSR, Sustains, Sync, Ring Mod, Unison |

@@ -20,10 +20,24 @@ parameters:
     range:
     - 0.0
     - 1.0
+  Amp Env Sustain:
+    continuous: true
+    encoding: vst
+    importance: 0.75
+    range:
+    - 0.0
+    - 1.0
   Cross Modulation:
     continuous: true
     encoding: vst
     importance: 0.5
+    range:
+    - 0.0
+    - 1.0
+  Filter 4-Pole Mode:
+    continuous: true
+    encoding: vst
+    importance: 0.60
     range:
     - 0.0
     - 1.0
@@ -39,6 +53,34 @@ parameters:
     continuous: true
     encoding: vst
     importance: 0.85
+    range:
+    - 0.0
+    - 1.0
+  Filter Env Attack:
+    continuous: true
+    encoding: vst
+    importance: 0.90
+    range:
+    - 0.0
+    - 1.0
+  Filter Env Decay:
+    continuous: true
+    encoding: vst
+    importance: 0.85
+    range:
+    - 0.0
+    - 1.0
+  Filter Env Release:
+    continuous: true
+    encoding: vst
+    importance: 0.60
+    range:
+    - 0.0
+    - 1.0
+  Filter Env Sustain:
+    continuous: true
+    encoding: vst
+    importance: 0.80
     range:
     - 0.0
     - 1.0
@@ -77,10 +119,31 @@ parameters:
     range:
     - 0.0
     - 1.0
+  Noise Color:
+    continuous: true
+    encoding: vst
+    importance: 0.65
+    range:
+    - 0.0
+    - 1.0
+  Noise Volume:
+    continuous: true
+    encoding: vst
+    importance: 0.90
+    range:
+    - 0.0
+    - 1.0
   Osc 1 Pitch:
     continuous: true
     encoding: vst
     importance: 0.6
+    range:
+    - 0.0
+    - 1.0
+  Osc 1 Pulse Wave:
+    continuous: true
+    encoding: vst
+    importance: 0.85
     range:
     - 0.0
     - 1.0
@@ -98,6 +161,27 @@ parameters:
     range:
     - 0.0
     - 1.0
+  Osc 2 Pitch:
+    continuous: true
+    encoding: vst
+    importance: 0.75
+    range:
+    - 0.0
+    - 1.0
+  Osc 2 Pulse Wave:
+    continuous: true
+    encoding: vst
+    importance: 0.70
+    range:
+    - 0.0
+    - 1.0
+  Osc 2 Volume:
+    continuous: true
+    encoding: vst
+    importance: 0.80
+    range:
+    - 0.0
+    - 1.0
   Osc Pulsewidth:
     continuous: true
     encoding: vst
@@ -105,113 +189,78 @@ parameters:
     range:
     - 0.0
     - 1.0
-# Parameters optimised only by S07 CMA-ES (not part of the surrogate training
-# set — do NOT add these to `parameters` above or the surrogate input_dim
-# will change and the existing checkpoint will become invalid).
-#
-# Each entry may carry optional bounds [lo, hi] within [0, 1] that constrain
-# the CMA-ES search for that param.  Omit bounds to use [0, 1].
-#
-# Ordering by expected timbral impact:
-#
-# NOISE / INHARMONIC  — primary source of missing "air" and bird-call texture
-#   Noise Volume      — adds white/pink noise to the signal path
-#   Noise Color       — 0=white, 1=pink; warmer noise for organic sounds
-#   Ring Mod Volume   — inharmonic sum/difference tones; chirpy/metallic quality
-#
-# OSCILLATOR TUNING
-#   Osc 2 Pitch       — semitone offset for Osc 2 (0=low, 0.5=unison, 1=high)
-#                        allows octave (+12), fifth (+7), unison (0) intervals
-#   Osc 2 Volume      — second oscillator level
-#
-# FILTER ENVELOPE  — controls brightness sweep over note duration
-#   Filter Env Attack   — how quickly filter opens at note-on
-#   Filter Env Decay    — how quickly filter falls to sustain level
-#   Filter Env Sustain  — steady-state filter opening during note
-#   Filter Env Release  — LOWER BOUND 0.2: must not close faster than amp
-#                         release or the resonant filter ping artifact occurs
-#                         (filter snapping shut while amp still decays)
-#
-# AMP / UNISON
-#   Amp Env Sustain   — note body level
-#   Unison Detune     — chorus / beating width
+  Osc Sync:
+    continuous: true
+    encoding: vst
+    importance: 0.45
+    range:
+    - 0.0
+    - 1.0
+  Ring Mod Volume:
+    continuous: true
+    encoding: vst
+    importance: 0.65
+    range:
+    - 0.0
+    - 1.0
+  Unison Detune:
+    continuous: true
+    encoding: vst
+    importance: 0.55
+    range:
+    - 0.0
+    - 1.0
 cmaes_extra_params:
-  # SURROGATE PARAMS WITH CMA-ES BOUNDS
-  # These are already in the surrogate's parameter set; listing them here only
-  # adds search bounds so CMA-ES can't push them to extremes that corrupt pitch.
-  #
-  # Cross Modulation — FM between osc 1 & 2. At > 0.15 creates dominant sidebands
-  #   at fc ± 2*fm (e.g. 1109 + 2*829 = 2767Hz) that MASK the fundamental.
-  #   Bound to [0, 0.15] so the fundamental stays audible at the MIDI pitch.
+  # Surrogate params with CMA-ES bounds — prevents extremes that corrupt pitch or
+  # create aliasing artefacts. All these params are also in the surrogate `parameters`
+  # above; listing them here only constrains the CMA-ES search range.
   Cross Modulation:
     importance: 0.60
     bounds: [0.0, 0.15]
-  #
-  # Amp Env Attack — burst events at 87ms/138ms require fast attack (< 30ms).
-  #   Without this bound CMA-ES finds 0.9 (near-maximum) which makes the attack
-  #   too slow for any short burst note-on to be heard.
   Amp Env Attack:
     importance: 0.80
     bounds: [0.0, 0.30]
-  #
-  # NOISE / INHARMONIC  — primary source of missing "air" and bird-call texture
-  Noise Volume:
-    importance: 0.95
-    bounds: [0.0, 0.4]       # cap at 40% noise or it overwhelms the tone
-  Noise Color:
-    importance: 0.70
   Ring Mod Volume:
-    importance: 0.85
-    bounds: [0.0, 0.25]      # tight: >0.25 creates strong diff-tones that shift
-                              # perceived pitch away from fundamental
-  #
-  # OSCILLATOR TUNING
-  Osc 2 Pitch:
-    importance: 0.80
-    bounds: [0.40, 0.60]     # ±4.8 semitones max; larger intervals create FM
-                              # sidebands (e.g. -4st Osc2 → fc+2*fm sideband that
-                              # dominates at 2.5× the fundamental frequency)
-  Osc 2 Volume:
-    importance: 0.70
-    bounds: [0.0, 0.50]      # Osc 2 must not dominate Osc 1 (reset: 0.7) or the
-                              # detuned Osc 2 becomes the perceived pitch
-  #
-  # FILTER ENVELOPE
-  Filter Env Attack:
-    importance: 0.90
-  Filter Env Decay:
-    importance: 0.85
-  Filter Env Sustain:
-    importance: 0.80
-  Filter Env Release:
     importance: 0.65
-    bounds: [0.2, 1.0]       # must be >= Amp Env Release (0.2) to prevent
-                              # filter-ping: resonant ring when filter snaps
-                              # shut while amp is still in its release phase
-  Amp Env Sustain:
+    bounds: [0.0, 0.25]
+  Osc 2 Pitch:
     importance: 0.75
-  Unison Detune:
-    importance: 0.50
+    bounds: [0.40, 0.60]
+  Osc 2 Volume:
+    importance: 0.80
+    bounds: [0.0, 0.50]
+  Filter Env Release:
+    importance: 0.60
+    bounds: [0.2, 1.0]
 
 probe:
   hold_sec: 1.5
   notes:
-  - 34
+  - 24
+  - 27
+  - 30
+  - 33
   - 36
-  - 38
-  - 40
+  - 39
   - 42
-  - 44
-  - 46
+  - 45
   - 48
-  - 50
-  - 52
+  - 51
   - 54
-  - 56
-  - 58
+  - 57
   - 60
+  - 63
+  - 66
+  - 69
   - 72
+  - 75
+  - 78
+  - 81
   - 84
+  - 87
+  - 90
+  - 93
+  - 96
   pre_roll_sec: 0.2
   release_sec: 4.5
   render_sec: 6.1
@@ -223,6 +272,7 @@ reset:
   Amp Env Release: 0.2
   Amp Env Sustain: 1.0
   Cross Modulation: 0.0
+  Filter 4-Pole Mode: 0.0
   Filter Cutoff: 0.7
   Filter Env Amount: 0.3
   Filter Env Attack: 0.0
@@ -243,8 +293,10 @@ reset:
   Osc 1 Volume: 0.7
   Osc 2 Detune: 0.5
   Osc 2 Pitch: 0.5
+  Osc 2 Pulse Wave: 0.0
   Osc 2 Volume: 0.3
   Osc Pulsewidth: 0.5
+  Osc Sync: 0.0
   Ring Mod Volume: 0.0
   Unison Detune: 0.1
 synth:

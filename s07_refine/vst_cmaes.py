@@ -169,6 +169,7 @@ def cmaes_refine(
     crossfade_sec: float = 0.05,    # linear blend window at region boundaries
     verbose: bool = True,
     on_improvement=None,   # Callable[[pd.DataFrame, float], None] | None
+    analysis=None,         # TargetAnalysis | None — dynamic Amp Env Attack upper bound
 ) -> CMAESResult:
     """CMA-ES refinement with selectable mode.
 
@@ -208,6 +209,14 @@ def cmaes_refine(
         f"p_{name}": (cfg["lo"], cfg["hi"])
         for name, cfg in extra_param_meta.items()
     }
+
+    # Dynamic Amp Env Attack bound: transient_min_ms * 0.5 gives the maximum
+    # attack time the synth can have and still respond within each transient.
+    if analysis is not None:
+        t_min_ms = float(getattr(analysis, "transient_min_ms", 1000.0)) * 0.5
+        t_min_ms = max(t_min_ms, 1.0)
+        hi_attack = float(np.clip(np.log10(t_min_ms) / 4.0, 0.0, 1.0))
+        extra_bounds["p_Amp Env Attack"] = (0.0, hi_attack)
 
     if verbose:
         print(f"  Mode: {mode}  |  {len(param_cols)} surrogate + "

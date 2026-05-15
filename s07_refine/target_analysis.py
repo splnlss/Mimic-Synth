@@ -116,6 +116,7 @@ class TargetAnalysis:
     harmonic_richness:        float = 0.5    # overtone strength relative to fundamental → Osc 2 Volume
     harmonic_slope_resonance: float = 0.2    # harmonic decay slope → Filter Resonance (replaces flatness)
     f0_source:                str   = "hps"  # "crepe" | "dio" | "hps" — diagnostic
+    transient_min_ms:         float = 1000.0  # shortest onset interval (ms); 1000.0 = no short transients detected
 
 
 # ── Core analysis ────────────────────────────────────────────────────────────
@@ -200,6 +201,7 @@ def analyze_target(
     # ── Q2: Amplitude envelope ───────────────────────────────────────────────
 
     attack_ms, decay_ms, sustain_level, release_ms = _estimate_adsr(voiced, sr)
+    transient_min_ms = _detect_transient_min_ms(voiced, sr)
 
     # ── Q3: Filter parameters ────────────────────────────────────────────────
 
@@ -343,6 +345,7 @@ def analyze_target(
         harmonic_richness=harmonic_richness,
         harmonic_slope_resonance=harmonic_slope_resonance,
         f0_source=f0_source,
+        transient_min_ms=transient_min_ms,
     )
 
 
@@ -811,6 +814,35 @@ def _estimate_lfo_rate(centroids: np.ndarray, hop_sec: float) -> float:
         return 0.0
     best_lag = peaks[np.argmax(props["peak_heights"])] + min_lag
     return float(1.0 / (best_lag * hop_sec))
+
+
+def _detect_transient_min_ms(audio: np.ndarray, sr: int) -> float:
+    """Detect the shortest inter-onset interval in `audio` (milliseconds).
+
+    Returns 1000.0 when librosa is unavailable, audio is too short, or fewer
+    than 2 onsets are detected — interpreted as "no short transients detected".
+
+    Used by vst_cmaes.py to dynamically tighten the Amp Env Attack upper bound:
+    an attack longer than transient_min_ms * 0.5 would cause the synth to miss
+    the onset of each transient burst entirely.
+    """
+    try:
+        import librosa
+    except ImportError:
+        return 1000.0
+    if len(audio) < int(sr * 0.05):
+        return 1000.0
+    try:
+        onsets = librosa.onset.onset_detect(
+            y=audio.astype(np.float32), sr=sr,
+            hop_length=int(sr * 0.005), backtrack=True, units="samples"
+        )
+        if len(onsets) < 2:
+            return 1000.0
+        intervals_ms = np.diff(onsets.astype(np.float64)) / sr * 1000.0
+        return float(intervals_ms.min())
+    except Exception:
+        return 1000.0
 
 
 def _attack_ms_to_param(attack_ms: float) -> float:

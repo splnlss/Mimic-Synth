@@ -1577,6 +1577,7 @@ def _cmaes_step(
         popsize=popsize,
         maxiter=maxiter,
         on_improvement=_cmaes_checkpoint,
+        analysis=analysis,
     )
 
     # Smooth ring-mod params with a longer window to prevent high-freq aliasing
