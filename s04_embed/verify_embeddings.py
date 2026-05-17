@@ -205,7 +205,7 @@ def main() -> int:
     )
     ap.add_argument("--embeddings", default=str(_defs.S04_EMBEDDINGS),
                     help="Path to encodec_embeddings.npy")
-    ap.add_argument("--dataset", default=str(_defs.S02_DIR),
+    ap.add_argument("--dataset", default=str(_defs.S03_DIR),
                     help="Path to dataset dir (with samples.parquet)")
     ap.add_argument("--spot-check", action="store_true",
                     help="Run nearest/farthest neighbor spot-check")

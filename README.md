@@ -103,11 +103,10 @@ Key features (v1.2):
 
 ### 3. Build the dataset (S03)
 
-Post-hoc mode reads an existing capture, applies quality gates, and writes a manifest. No re-rendering needed. All paths default via `defaults.py`.
+Post-hoc mode reads an existing capture, applies quality gates, and writes a manifest. No re-rendering needed and no WAV copying — the output parquet stores absolute paths back into `s02_capture`. All paths default via `defaults.py`.
 
 ```bash
-python -m s03_dataset.build_dataset \
-    --from-capture /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s02_capture
+python -m s03_dataset.build_dataset
 ```
 
 Or live capture from scratch (slower, requires DawDreamer):
@@ -119,8 +118,7 @@ python -m s03_dataset.build_dataset --m 14
 Verify the result:
 
 ```bash
-python -m s03_dataset.verify_dataset \
-    --dataset /mnt/d/Mimic-Synth-Data/OB-X_Prototype/s03_dataset
+python -m s03_dataset.verify_dataset
 ```
 
 ### 4. Embed the dataset (S04)
@@ -279,7 +277,7 @@ s02_capture/
   capture_v1_2.py            # Current capture rig (M=14 production)
 
 s03_dataset/
-  build_dataset.py           # Dataset builder CLI (--from-capture or --m)
+  build_dataset.py           # Dataset builder CLI (default: post-hoc from S02_DIR; --m for live capture)
   sampling.py                # Sobol sampling + importance weighting
   quality.py                 # Per-capture quality gates
   manifest.py                # Reproducibility manifest

@@ -240,7 +240,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Pre-compute EnCodec embeddings for a capture dataset."
     )
-    ap.add_argument("--dataset", default=str(_defs.S02_DIR),
+    ap.add_argument("--dataset", default=str(_defs.S03_DIR),
                     help="Path to dataset dir (with samples.parquet + wav/)")
     ap.add_argument("--out", default=str(_defs.S04_DIR),
                     help="Output directory for encodec_embeddings.npy")

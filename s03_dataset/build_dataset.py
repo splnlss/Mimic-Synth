@@ -18,7 +18,6 @@ Usage:
 """
 from __future__ import annotations
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
@@ -132,13 +131,13 @@ def build_from_capture(
     """Build a quality-gated dataset from an existing capture directory.
 
     Reads samples.parquet + WAVs produced by capture_v1_2.py, runs quality
-    gates on each WAV, copies valid captures to out_dir, and writes a
-    manifest. No DawDreamer required.
+    gates, and writes a manifest + filtered parquet. WAV paths in the output
+    parquet are absolute references to the capture directory — no copying.
+    No DawDreamer required.
     """
     capture_dir = Path(capture_dir)
     out_dir = Path(out_dir)
-    wav_dir = out_dir / "wav"
-    wav_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     with open(profile_path) as f:
         profile = yaml.safe_load(f)
@@ -205,11 +204,7 @@ def build_from_capture(
 
         h = str(row["hash"])
         note = int(row["note"])
-        out_wav = wav_dir / f"{h}_n{note}.wav"
-        if not out_wav.exists():
-            shutil.copy2(wav_path, out_wav)
-
-        row_dict = {"hash": h, "note": note, "wav": f"wav/{h}_n{note}.wav", "self_noise": self_noise}
+        row_dict = {"hash": h, "note": note, "wav": str(wav_path.resolve()), "self_noise": self_noise}
         for col in df.columns:
             if col.startswith("p_"):
                 row_dict[col] = float(row[col])
@@ -226,22 +221,22 @@ def main() -> int:
     ap.add_argument("--profile", default=str(_defs.PROFILE_PATH))
     ap.add_argument("--out", default=str(_defs.S03_DIR))
 
-    mode = ap.add_mutually_exclusive_group(required=True)
+    mode = ap.add_mutually_exclusive_group(required=False)
     mode.add_argument("--m", type=int, help="Live capture: Sobol exponent — generates 2**m vectors")
-    mode.add_argument("--from-capture", default=None,
+    mode.add_argument("--from-capture", default=str(_defs.S02_DIR),
                       help=f"Post-hoc: path to existing capture dir (default: {_defs.S02_DIR})")
 
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--importance-mode", choices=["filter", "scale"], default="filter")
     args = ap.parse_args()
 
-    if args.from_capture:
-        manifest = build_from_capture(args.from_capture, args.profile, args.out)
-    else:
+    if args.m is not None:
         manifest = build_dataset(
             args.profile, args.out, m=args.m, seed=args.seed,
             importance_mode=args.importance_mode,
         )
+    else:
+        manifest = build_from_capture(args.from_capture, args.profile, args.out)
     print(f"Done. Rendered={manifest.counts.rendered} valid={manifest.counts.valid}")
     return 0
 

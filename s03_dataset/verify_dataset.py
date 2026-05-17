@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 import numpy as np
+import defaults as _defs
 import pandas as pd
 import soundfile as sf
 import yaml
@@ -247,8 +248,8 @@ def _write_failure_report(report: Report, dataset_arg: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True, help="Path to dataset directory")
-    parser.add_argument("--profile", required=True, help="Path to profile YAML")
+    parser.add_argument("--dataset", default=str(_defs.S03_DIR), help="Path to dataset directory")
+    parser.add_argument("--profile", default=str(_defs.PROFILE_PATH), help="Path to profile YAML")
     parser.add_argument(
         "--fail-threshold", type=float, default=0.01,
         help="Max acceptable rate for silent/clipped/stuck/bleed/missing (default 1%%)",
