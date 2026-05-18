@@ -1,4 +1,5 @@
 dawdreamer
+laion-clap
 numpy
 scipy
 soundfile

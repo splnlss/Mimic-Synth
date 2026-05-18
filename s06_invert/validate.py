@@ -42,7 +42,12 @@ def _load_surrogate(checkpoint_path: Path, device: str) -> tuple[Surrogate, dict
     manifest_path = checkpoint_path.parent / "manifest.json"
     with open(manifest_path) as f:
         manifest = json.load(f)
-    model = Surrogate(input_dim=manifest["input_dim"]).to(device)
+    model = Surrogate(
+        input_dim  = manifest["input_dim"],
+        hidden_dim = manifest.get("hidden_dim",  512),
+        use_film   = manifest.get("use_film",    False),
+        output_dim = manifest.get("output_dim",  128),
+    ).to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     model.eval()
     return model, manifest
