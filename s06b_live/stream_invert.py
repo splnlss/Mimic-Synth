@@ -416,36 +416,71 @@ def _centroid_hz_to_filter_cutoff(centroid_hz: np.ndarray, sr: int) -> np.ndarra
     return np.clip(0.3 + centroid_norm * 0.6, 0.3, 0.95)
 
 
+def _numpy_spectral_centroid(
+    audio: np.ndarray,
+    sr: int,
+    hop: int,
+    n_fft: int = 2048,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pure-numpy spectral centroid fallback used when librosa is absent.
+
+    Returns (centroid_hz [n_frames], time_sec [n_frames]).
+    """
+    frames, times = [], []
+    win = np.hanning(n_fft)
+    pos = 0
+    while pos + n_fft <= len(audio):
+        mag = np.abs(np.fft.rfft(audio[pos:pos + n_fft] * win))
+        freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+        total = mag.sum()
+        c = float((freqs * mag).sum() / total) if total > 0 else float(sr) / 8.0
+        frames.append(c)
+        times.append(pos / sr)
+        pos += hop
+    if not frames:
+        return np.array([float(sr) / 8.0]), np.array([0.0])
+    return np.array(frames, dtype=np.float64), np.array(times, dtype=np.float64)
+
+
 def _compute_filter_cutoff_trajectory(
     audio: np.ndarray,
     sr: int,
     timestamps: np.ndarray,
     smooth_window: int = 3,
 ) -> np.ndarray:
-    """Per-frame Filter Cutoff trajectory from pyworld SP + librosa centroid.
+    """Per-frame Filter Cutoff trajectory from pyworld SP + spectral centroid.
 
     For voiced frames uses CheapTrick spectral envelope centroid (roadmap §II.A).
-    For unvoiced/silence falls back to librosa.feature.spectral_centroid.
+    For unvoiced/silence falls back to spectral centroid (librosa if available,
+    otherwise a pure-numpy FFT-based implementation).
     Maps Hz → [0.30, 0.95] via _centroid_hz_to_filter_cutoff, then interpolates
     to the surrogate `timestamps` (50ms hop) and smooths.
 
     Returns float32 array of shape [len(timestamps)] in [0, 1].
     """
-    import librosa
+    try:
+        import librosa as _librosa
+        _LIBROSA_AVAILABLE = True
+    except ImportError:
+        _LIBROSA_AVAILABLE = False
+
     try:
         import pyworld as pw
         _PW_AVAILABLE = True
     except ImportError:
         _PW_AVAILABLE = False
 
-    # Librosa centroid — works for all frames including unvoiced
-    hop_lib = max(1, int(sr * 0.010))   # 10ms
-    centroid_lib_arr = librosa.feature.spectral_centroid(
-        y=audio, sr=sr, hop_length=hop_lib
-    )[0]                                                        # [n_lib], Hz
-    lib_t = librosa.frames_to_time(
-        np.arange(len(centroid_lib_arr)), sr=sr, hop_length=hop_lib
-    )
+    hop_lib = max(1, int(sr * 0.010))   # 10ms hop for centroid
+    if _LIBROSA_AVAILABLE:
+        centroid_lib_arr = _librosa.feature.spectral_centroid(
+            y=audio, sr=sr, hop_length=hop_lib
+        )[0]
+        lib_t = _librosa.frames_to_time(
+            np.arange(len(centroid_lib_arr)), sr=sr, hop_length=hop_lib
+        )
+    else:
+        centroid_lib_arr, lib_t = _numpy_spectral_centroid(audio, sr, hop_lib)
+
     # Guard NaN/zero from silent frames
     valid_lib = centroid_lib_arr > 0
     if valid_lib.any():
@@ -455,7 +490,6 @@ def _compute_filter_cutoff_trajectory(
     centroid_lib_arr = np.where(valid_lib, centroid_lib_arr, fallback_hz)
 
     if not _PW_AVAILABLE or len(audio) < int(sr * 0.10):
-        # Fallback: librosa only
         fc_lib = _centroid_hz_to_filter_cutoff(centroid_lib_arr, sr)
         fc_traj = np.interp(timestamps, lib_t, fc_lib)
         return np.clip(smooth_trajectory(fc_traj, smooth_window), 0.0, 1.0)
@@ -477,7 +511,6 @@ def _compute_filter_cutoff_trajectory(
         lib_at_pw = np.interp(pw_t, lib_t, centroid_lib_arr)
         centroid_hybrid = np.where(voiced, centroid_sp, lib_at_pw)
 
-        # NaN/Inf from SP on degenerate frames
         bad = ~np.isfinite(centroid_hybrid) | (centroid_hybrid <= 0)
         centroid_hybrid = np.where(bad, lib_at_pw, centroid_hybrid)
 
@@ -485,7 +518,6 @@ def _compute_filter_cutoff_trajectory(
         fc_traj = np.interp(timestamps, pw_t, fc_pw)
 
     except Exception:
-        # Any pyworld failure → fall back to librosa
         fc_lib = _centroid_hz_to_filter_cutoff(centroid_lib_arr, sr)
         fc_traj = np.interp(timestamps, lib_t, fc_lib)
 

@@ -421,6 +421,7 @@ class TestLUFSNormalise:
     def test_loud_and_quiet_converge(self):
         """10× louder and 10× quieter versions of the same signal should have
         the same RMS after normalisation."""
+        pytest.importorskip("pyloudnorm")
         base = _sine(440.0, 1.0) * 0.3
         loud  = self.norm(base * 10.0, SR)
         quiet = self.norm(base * 0.1,  SR)
@@ -454,6 +455,7 @@ class TestLUFSNormalise:
 
     def test_mrstft_dist_level_invariant(self):
         """After normalisation, a 10× level shift should give near-zero MRSTFT distance."""
+        pytest.importorskip("pyloudnorm")
         from s07_refine.audio_compare import _mrstft_dist
         base   = _sine(440.0, 1.0) * 0.3
         normal = self.norm(base,        SR)
@@ -535,6 +537,7 @@ class TestSPScoring:
         assert total == pytest.approx(1.0, abs=1e-6), f"weights sum {total} ≠ 1.0"
 
     def test_sp_features_shape(self):
+        pytest.importorskip("pyworld")
         audio = _sine(440.0, 1.0)
         sp = self.sp_feats(audio, SR)
         assert sp is not None
@@ -547,10 +550,12 @@ class TestSPScoring:
         assert self.sp_feats(short, SR) is None
 
     def test_sp_dist_identical_near_zero(self):
+        pytest.importorskip("pyworld")
         sp = self.sp_feats(_sine(440.0, 1.0), SR)
         assert self.sp_dist(sp, sp) < 0.01
 
     def test_sp_dist_different_signals(self):
+        pytest.importorskip("pyworld")
         sp_bright = self.sp_feats(_sine(4000.0, 1.0), SR)
         sp_dark   = self.sp_feats(_sine(200.0,  1.0), SR)
         assert self.sp_dist(sp_bright, sp_dark) > 0.0
@@ -577,6 +582,7 @@ class TestCREPEWarmStart:
     # ── _crepe_f0 ──────────────────────────────────────────────────────────
 
     def test_crepe_f0_returns_tuple(self):
+        pytest.importorskip("torchcrepe")
         audio = _sine(440.0, 1.0)
         result = self.crepe_f0(audio, SR)
         assert result is not None, "CREPE should succeed on 1s 440Hz sine"
@@ -585,12 +591,14 @@ class TestCREPEWarmStart:
         assert len(f0) > 0
 
     def test_crepe_f0_voiced_majority(self):
+        pytest.importorskip("torchcrepe")
         audio = _sine(440.0, 1.0)
         f0, t = self.crepe_f0(audio, SR)
         voiced_frac = (f0 > 0).mean()
         assert voiced_frac > 0.5, f"Most frames should be voiced, got {voiced_frac:.2f}"
 
     def test_crepe_f0_silence_unvoiced(self):
+        pytest.importorskip("torchcrepe")
         silence = np.zeros(SR, dtype=np.float32)
         f0, t = self.crepe_f0(silence, SR)
         assert (f0 == 0).all(), "Silent audio should have all unvoiced frames"
@@ -600,6 +608,7 @@ class TestCREPEWarmStart:
         assert self.crepe_f0(short, SR) is None
 
     def test_crepe_f0_frequency_accuracy(self):
+        pytest.importorskip("torchcrepe")
         audio = _sine(440.0, 1.0)
         f0, _ = self.crepe_f0(audio, SR)
         voiced = f0[f0 > 0]

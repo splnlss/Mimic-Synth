@@ -119,13 +119,7 @@ def train():
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             torch.save(model.state_dict(), os.path.join(run_dir, "state_dict.pt"))
-            # Export ONNX as well
-            dummy_p = torch.randn(1, len(param_cols)).to(args.device)
-            dummy_n = torch.tensor([0.5]).to(args.device)
-            torch.onnx.export(model, (dummy_p, dummy_n), 
-                             os.path.join(run_dir, "surrogate.onnx"),
-                             input_names=["params", "note"], output_names=["encodec_latent"],
-                             dynamic_axes={"params": {0: "batch"}, "note": {0: "batch"}, "encodec_latent": {0: "batch"}})
+            print(f"  → new best, saved state_dict.pt")
 
     # Save manifest
     manifest = {
@@ -137,6 +131,22 @@ def train():
     }
     with open(os.path.join(run_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=4)
+
+    # Export ONNX once, from the best weights, after training completes.
+    model.load_state_dict(torch.load(os.path.join(run_dir, "state_dict.pt"),
+                                     map_location=args.device, weights_only=True))
+    model.eval()
+    dummy_p = torch.randn(1, len(param_cols)).to(args.device)
+    dummy_n = torch.tensor([0.5]).to(args.device)
+    batch = torch.export.Dim("batch")
+    torch.onnx.export(
+        model, (dummy_p, dummy_n),
+        os.path.join(run_dir, "surrogate.onnx"),
+        input_names=["params", "note"],
+        output_names=["encodec_latent"],
+        dynamic_shapes={"params": {0: batch}, "note": {0: batch}},
+    )
+    print("ONNX exported.")
 
 if __name__ == "__main__":
     train()
