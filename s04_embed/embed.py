@@ -141,6 +141,28 @@ class Embedder:
                 out[i] = np.concatenate([e.mean(axis=1), e.std(axis=1)])
         return out
 
+    @torch.no_grad()
+    def clap_embed(self, audio: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
+        """Embed audio to a 512-d LAION-CLAP vector (music model).
+
+        Lazy-loads the CLAP module on first call; subsequent calls reuse it.
+        Returns np.ndarray [512] float32.
+        """
+        import laion_clap
+        if not hasattr(self, "_clap"):
+            self._clap = laion_clap.CLAP_Module(enable_fusion=False, amodel="HTSAT-base")
+            self._clap.load_ckpt()
+            self._clap.eval()
+        # Resample to 48 kHz (CLAP requirement) if needed
+        x = torch.from_numpy(audio).float()
+        if x.ndim == 1:
+            x = x.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+        audio_48 = convert_audio(x, sr, ENCODEC_SR, 1).squeeze().numpy()
+        emb = self._clap.get_audio_embedding_from_data(
+            audio_48[np.newaxis], use_tensor=False
+        )  # [1, 512]
+        return emb[0].astype(np.float32)  # [512]
+
     def mrstft_feats(self, audio: np.ndarray) -> np.ndarray:
         """Multi-resolution STFT features (time-collapsed log-magnitude).
 

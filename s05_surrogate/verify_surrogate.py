@@ -53,7 +53,12 @@ def _load_surrogate(checkpoint_path: Path, input_dim_override: int | None, devic
             f"manifest.json not found alongside {checkpoint_path}; pass --input-dim explicitly"
         )
 
-    model = Surrogate(input_dim=input_dim).to(device)
+    model = Surrogate(
+        input_dim  = input_dim,
+        hidden_dim = manifest.get("hidden_dim",  512) if manifest else 512,
+        use_film   = manifest.get("use_film",    False) if manifest else False,
+        output_dim = manifest.get("output_dim",  128) if manifest else 128,
+    ).to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     model.eval()
     return model, manifest
@@ -196,7 +201,7 @@ def verify(
         df = pd.read_parquet(dataset_path)
         param_cols = [c for c in df.columns if c.startswith("p_")]
     else:
-        param_cols = [f"p_{i}" for i in range(model.net[0].in_features - 1)]
+        param_cols = [f"p_{i}" for i in range(model.n_params)]
 
     d_params = len(param_cols)
     print(f"--- Surrogate Verification ({checkpoint_path}) ---")

@@ -44,17 +44,25 @@ def _load_surrogate(checkpoint_path: Path, device: str) -> tuple[Surrogate, dict
     with open(manifest_path) as f:
         manifest = json.load(f)
 
-    input_dim = manifest["input_dim"]
-    model = Surrogate(input_dim=input_dim).to(device)
+    model = Surrogate(
+        input_dim  = manifest["input_dim"],
+        hidden_dim = manifest.get("hidden_dim",  512),
+        use_film   = manifest.get("use_film",    False),
+        output_dim = manifest.get("output_dim",  128),
+    ).to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     model.eval()
     return model, manifest
 
 
-def _embed_target(wav_path: Path, device: str) -> np.ndarray:
+def _embed_target(wav_path: Path, device: str, embed_model: str = "encodec") -> np.ndarray:
     from s04_embed.embed import Embedder
     audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
     embedder = Embedder(device=device)
+    if embed_model == "clap":
+        return embedder.clap_embed(audio, sr)   # [512]
     return embedder.encodec_embed(audio, sr, pool="mean")  # [128]
 
 
@@ -104,10 +112,11 @@ def invert(
         profile = yaml.safe_load(f)
 
     surrogate, manifest = _load_surrogate(surrogate_checkpoint, device)
-    param_cols = manifest["param_cols"]  # ["p_Osc 1 Pitch", ...]
-    d_params = len(param_cols)
+    param_cols  = manifest["param_cols"]
+    d_params    = len(param_cols)
+    embed_model = manifest.get("embed_model", "encodec")
 
-    target_emb_np = _embed_target(target_wav, device)
+    target_emb_np = _embed_target(target_wav, device, embed_model)
     target_emb = torch.tensor(target_emb_np, dtype=torch.float32)
 
     profile_notes = profile["probe"]["notes"]

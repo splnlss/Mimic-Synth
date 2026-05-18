@@ -30,8 +30,12 @@ from defaults import SAMPLE_RATE
 from .embed import Embedder
 
 CHECKPOINT_EVERY = 500
-NPY_FILENAME = "encodec_embeddings.npy"
-DONE_FILENAME = "encodec_embeddings_done.npy"
+NPY_FILENAME      = "encodec_embeddings.npy"
+DONE_FILENAME     = "encodec_embeddings_done.npy"
+CLAP_NPY_FILENAME = "clap_embeddings.npy"
+CLAP_DONE_FILENAME= "clap_embeddings_done.npy"
+MRSTFT_NPY_FILENAME  = "mrstft_features.npy"
+MRSTFT_DONE_FILENAME = "mrstft_features_done.npy"
 
 
 def _prompt_resume_or_overwrite(npy_path: Path, n_done: int, n_total: int) -> str:
@@ -92,12 +96,18 @@ def _embed_batch(
     out_arr: np.ndarray,
     done_mask: np.ndarray,
     pool: str,
+    embed_model: str = "encodec",
 ) -> None:
     """Run one batch through the encoder and scatter results into out_arr."""
-    results = emb.encodec_embed_batch(audios, sr=sr, pool=pool)
-    for k, idx in enumerate(indices):
-        out_arr[idx] = results[k]
-        done_mask[idx] = True
+    if embed_model == "clap":
+        for k, idx in enumerate(indices):
+            out_arr[idx] = emb.clap_embed(audios[k], sr=sr)
+            done_mask[idx] = True
+    else:
+        results = emb.encodec_embed_batch(audios, sr=sr, pool=pool)
+        for k, idx in enumerate(indices):
+            out_arr[idx] = results[k]
+            done_mask[idx] = True
 
 
 def index_dataset(
@@ -106,13 +116,19 @@ def index_dataset(
     pool: str = "mean",
     batch_size: int = 32,
     device: str | None = None,
+    embed_model: str = "encodec",
+    compute_mrstft: bool = False,
 ) -> Path:
-    """Embed all captures and write encodec_embeddings.npy.
+    """Embed all captures and write embeddings .npy file(s).
+
+    embed_model="encodec" writes encodec_embeddings.npy (128-d or 256-d).
+    embed_model="clap"    writes clap_embeddings.npy (512-d, per-sample).
+    compute_mrstft=True   additionally writes mrstft_features.npy (1924-d).
 
     Supports resume: if a partial .npy + _done.npy exist, prompts to
     continue, overwrite, or abort. Checkpoints every 500 rows.
 
-    Returns the path to the output .npy file.
+    Returns the path to the primary output .npy file.
     """
     dataset_dir = Path(dataset_dir)
     out_dir = Path(out_dir)
@@ -128,21 +144,24 @@ def index_dataset(
 
     wav_root = _resolve_wav_root(dataset_dir, df)
 
-    dim = 128 if pool == "mean" else 256 if pool == "meanstd" else None
-    if dim is None:
-        raise ValueError("index_dataset requires pool='mean' or 'meanstd', not 'none'")
+    if embed_model == "clap":
+        dim = 512
+        npy_path  = out_dir / CLAP_NPY_FILENAME
+        done_path = out_dir / CLAP_DONE_FILENAME
+    else:
+        dim = 128 if pool == "mean" else 256 if pool == "meanstd" else None
+        if dim is None:
+            raise ValueError("index_dataset requires pool='mean' or 'meanstd', not 'none'")
+        npy_path  = out_dir / NPY_FILENAME
+        done_path = out_dir / DONE_FILENAME
 
-    npy_path = out_dir / NPY_FILENAME
-    done_path = out_dir / DONE_FILENAME
-
-    # ── Resume / overwrite logic ─────────────────────────────────────────
-    out_arr = np.zeros((len(df), dim), dtype=np.float32)
+    # ── Resume / overwrite logic (primary embeddings) ────────────────────
+    out_arr   = np.zeros((len(df), dim), dtype=np.float32)
     done_mask = np.zeros(len(df), dtype=bool)
 
     if npy_path.exists() and done_path.exists():
-        existing_arr = np.load(npy_path)
+        existing_arr  = np.load(npy_path)
         existing_done = np.load(done_path)
-        # Validate shape compatibility with current parquet
         if existing_arr.shape == (len(df), dim) and existing_done.shape == (len(df),):
             n_done = int(existing_done.sum())
             choice = _prompt_resume_or_overwrite(npy_path, n_done, len(df))
@@ -150,10 +169,10 @@ def index_dataset(
                 print("Aborted.")
                 return npy_path
             elif choice == "resume":
-                out_arr = existing_arr
+                out_arr   = existing_arr
                 done_mask = existing_done
                 print(f"Resuming — {n_done} embeddings already complete.")
-            else:  # overwrite
+            else:
                 npy_path.unlink(missing_ok=True)
                 done_path.unlink(missing_ok=True)
                 print("Cleared existing embeddings.")
@@ -161,21 +180,62 @@ def index_dataset(
             print(f"Existing embeddings shape mismatch (expected ({len(df)}, {dim}), "
                   f"got {existing_arr.shape}) — starting fresh.")
     elif npy_path.exists():
-        # .npy without done mask — can't tell what's done, start fresh
         npy_path.unlink(missing_ok=True)
 
+    # ── MRSTFT aux arrays ────────────────────────────────────────────────
+    mrstft_arr  = None
+    mrstft_done = None
+    mrstft_npy  = out_dir / MRSTFT_NPY_FILENAME
+    mrstft_done_path = out_dir / MRSTFT_DONE_FILENAME
+
+    if compute_mrstft:
+        mrstft_arr  = np.zeros((len(df), 1924), dtype=np.float32)
+        mrstft_done = np.zeros(len(df), dtype=bool)
+        if mrstft_npy.exists() and mrstft_done_path.exists():
+            ex_m = np.load(mrstft_npy)
+            ex_d = np.load(mrstft_done_path)
+            if ex_m.shape == (len(df), 1924) and ex_d.shape == (len(df),):
+                # sync resume mask with primary: only re-compute rows not yet done
+                mrstft_arr  = ex_m
+                mrstft_done = ex_d
+                print(f"MRSTFT: resuming — {int(ex_d.sum())} already complete.")
+        elif mrstft_npy.exists():
+            mrstft_npy.unlink(missing_ok=True)
+
     # ── Embedding loop ───────────────────────────────────────────────────
-    n_already = int(done_mask.sum())
-    emb = Embedder(device=device)
-    skipped = 0
+    n_already  = int(done_mask.sum())
+    emb        = Embedder(device=device)
+    skipped    = 0
     newly_done = 0
-    next_ckpt = CHECKPOINT_EVERY
+    next_ckpt  = CHECKPOINT_EVERY
 
     pbar = tqdm(total=len(df), initial=n_already, desc="embedding")
 
     batch_indices: list[int] = []
-    batch_audios: list[np.ndarray] = []
+    batch_audios:  list[np.ndarray] = []
     batch_sr: int = SAMPLE_RATE
+
+    def _flush_all() -> None:
+        _flush(npy_path, done_path, out_arr, done_mask)
+        if compute_mrstft and mrstft_arr is not None and mrstft_done is not None:
+            _flush(mrstft_npy, mrstft_done_path, mrstft_arr, mrstft_done)
+
+    def _process_batch() -> None:
+        nonlocal newly_done, next_ckpt
+        _embed_batch(emb, batch_indices, batch_audios, batch_sr,
+                     out_arr, done_mask, pool, embed_model)
+        if compute_mrstft and mrstft_arr is not None and mrstft_done is not None:
+            for k, idx in enumerate(batch_indices):
+                if not mrstft_done[idx]:
+                    mrstft_arr[idx]  = emb.mrstft_feats(batch_audios[k])
+                    mrstft_done[idx] = True
+        pbar.update(len(batch_indices))
+        newly_done += len(batch_indices)
+        batch_indices.clear()
+        batch_audios.clear()
+        if newly_done >= next_ckpt:
+            _flush_all()
+            next_ckpt = newly_done + CHECKPOINT_EVERY
 
     for i, row in enumerate(df.itertuples()):
         if done_mask[i]:
@@ -192,68 +252,55 @@ def index_dataset(
 
         audio, file_sr = sf.read(wav_path, dtype="float32", always_2d=False)
 
-        # Flush before appending if sr changed (all captures are 48 kHz; defensive)
         if batch_indices and file_sr != batch_sr:
-            _embed_batch(emb, batch_indices, batch_audios, batch_sr, out_arr, done_mask, pool)
-            pbar.update(len(batch_indices))
-            newly_done += len(batch_indices)
-            batch_indices.clear()
-            batch_audios.clear()
-            if newly_done >= next_ckpt:
-                _flush(npy_path, done_path, out_arr, done_mask)
-                next_ckpt = newly_done + CHECKPOINT_EVERY
+            _process_batch()
 
         batch_sr = file_sr
         batch_indices.append(i)
         batch_audios.append(audio)
 
         if len(batch_indices) >= batch_size:
-            _embed_batch(emb, batch_indices, batch_audios, batch_sr, out_arr, done_mask, pool)
-            pbar.update(len(batch_indices))
-            newly_done += len(batch_indices)
-            batch_indices.clear()
-            batch_audios.clear()
-            if newly_done >= next_ckpt:
-                _flush(npy_path, done_path, out_arr, done_mask)
-                next_ckpt = newly_done + CHECKPOINT_EVERY
+            _process_batch()
 
-    # Flush remaining partial batch
     if batch_indices:
-        _embed_batch(emb, batch_indices, batch_audios, batch_sr, out_arr, done_mask, pool)
-        pbar.update(len(batch_indices))
-        newly_done += len(batch_indices)
+        _process_batch()
 
     pbar.close()
-
-    # Final save
-    _flush(npy_path, done_path, out_arr, done_mask)
+    _flush_all()
 
     _log_latent_stats(out_arr, done_mask, dim)
     if skipped:
         print(f"Warning: {skipped}/{len(df)} WAVs not found — zeros in output")
     print(f"Saved {npy_path} — shape {out_arr.shape}, "
           f"{int(done_mask.sum())}/{len(df)} complete")
+    if compute_mrstft:
+        print(f"Saved {mrstft_npy} — shape {mrstft_arr.shape}")
     return npy_path
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Pre-compute EnCodec embeddings for a capture dataset."
+        description="Pre-compute audio embeddings for a capture dataset."
     )
     ap.add_argument("--dataset", default=str(_defs.S03_DIR),
                     help="Path to dataset dir (with samples.parquet + wav/)")
     ap.add_argument("--out", default=str(_defs.S04_DIR),
-                    help="Output directory for encodec_embeddings.npy")
+                    help="Output directory for embeddings")
+    ap.add_argument("--embed-model", choices=["encodec", "clap"], default="encodec",
+                    help="Embedding model: encodec (128-d, default) or clap (512-d)")
     ap.add_argument("--pool", choices=["mean", "meanstd"], default="mean",
-                    help="Pooling mode: mean (128-d) or meanstd (256-d)")
+                    help="EnCodec pooling: mean (128-d) or meanstd (256-d); ignored for clap")
+    ap.add_argument("--mrstft", action="store_true",
+                    help="Also compute mrstft_features.npy (1924-d spectral features)")
     ap.add_argument("--batch-size", type=int, default=32,
-                    help="Number of WAVs per GPU forward pass (default: 32)")
+                    help="WAVs per GPU forward pass (ignored for clap, which is per-sample)")
     ap.add_argument("--device", default=None,
-                    help="Torch device override, e.g. cuda:0, cuda:1, cpu")
+                    help="Torch device override, e.g. cuda:0, cpu")
     args = ap.parse_args()
 
     index_dataset(args.dataset, args.out, pool=args.pool,
-                  batch_size=args.batch_size, device=args.device)
+                  batch_size=args.batch_size, device=args.device,
+                  embed_model=args.embed_model, compute_mrstft=args.mrstft)
     return 0
 
 

@@ -33,7 +33,12 @@ def load_surrogate(checkpoint_path: Path, device: str):
     manifest_path = checkpoint_path.parent / "manifest.json"
     with open(manifest_path) as f:
         manifest = json.load(f)
-    model = Surrogate(input_dim=manifest["input_dim"]).to(device)
+    model = Surrogate(
+        input_dim  = manifest["input_dim"],
+        hidden_dim = manifest.get("hidden_dim",  512),
+        use_film   = manifest.get("use_film",    False),
+        output_dim = manifest.get("output_dim",  128),
+    ).to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     model.eval()
     return model, manifest
@@ -220,7 +225,10 @@ def render_best_patch(best_patch, profile, run_dir):
 
 if __name__ == "__main__":
     target = str(TARGETS_DIR / "816426_crane-bird-scream.wav")
-    surrogate = str(S05_RUNS_DIR / "run_20260429_145056" / "state_dict.pt")
+    runs = sorted(S05_RUNS_DIR.glob("run_*")) if S05_RUNS_DIR.exists() else []
+    if not runs:
+        raise RuntimeError(f"No surrogate runs found in {S05_RUNS_DIR}; train one first.")
+    surrogate = str(runs[-1] / "state_dict.pt")
     profile = str(PROFILE_PATH)
     out_dir = str(S06_PATCHES_DIR)
     
