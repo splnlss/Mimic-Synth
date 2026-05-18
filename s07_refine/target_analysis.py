@@ -1,4 +1,4 @@
-"""Analyze target audio and map features to OB-Xf parameter initializations.
+"""Analyze target audio and map features to synth parameter initializations.
 
 This module answers the five design questions before CMA-ES begins so that
 the optimizer starts near a sensible region rather than a random one.
@@ -8,7 +8,7 @@ Design questions (from build_instructions/07 Refine VST Loop.md):
   Q1 — Oscillator type: saw, square/pulse, noise, or combination?
        → Detected via harmonic structure. Sawtooth has strong odd+even
          harmonics; square/pulse has strong odd harmonics; noise has flat
-         spectrum. The OB-Xf profile's continuous params (Osc Pulsewidth,
+         spectrum. The profile's continuous params (Osc Pulsewidth,
          Cross Modulation, Osc 2 Detune) are all tunable; wave TYPE is a
          discrete choice (saw vs pulse toggle) handled by OscConfig in
          vst_cmaes.py.
@@ -66,6 +66,78 @@ import numpy as np
 import scipy.signal as signal
 
 
+# ── Centroid trajectory (fallback: librosa; override: pyworld SP) ────────────
+
+def _centroid_trajectory(audio: np.ndarray, sr: int, hop_ms: float = 10.0) -> np.ndarray | None:
+    """Per-frame spectral centroid in Hz using librosa.
+
+    Returns array of shape [n_frames] or None if librosa is unavailable.
+    Used as a fallback when pyworld is absent; pyworld SP centroids are
+    more accurate and override this when available.
+    """
+    try:
+        import librosa
+    except ImportError:
+        return None
+    hop = max(1, int(hop_ms / 1000 * sr))
+    n_fft = min(2048, max(32, len(audio) // 8 * 2))
+    if len(audio) < n_fft:
+        return None
+    try:
+        ct = librosa.feature.spectral_centroid(
+            y=audio.astype(np.float32), sr=sr, n_fft=n_fft, hop_length=hop
+        )[0]
+        return ct.astype(np.float64)
+    except Exception:
+        return None
+
+
+def _filter_adsr_from_centroid(
+    ct_hz: np.ndarray,
+    frame_rate: float,          # frames per second
+) -> tuple[float, float, float, float]:
+    """Derive Filter Env Attack/Decay/Sustain/Amount from centroid Hz trajectory.
+
+    Reads the shape of the spectral brightness curve:
+      - Bright attack then darkening  → short attack, medium decay, high Env Amount
+      - Constant bright               → low Env Amount, high Sustain
+      - Slow brightening              → long attack, high Env Amount
+
+    Returns (filter_env_attack_est, filter_env_decay_est,
+             filter_env_sustain_est, filter_env_amount_est), all in [0, 1].
+    """
+    if len(ct_hz) < 4:
+        return 0.0, 0.3, 0.8, 0.1
+
+    ct = ct_hz / (ct_hz.max() + 1e-8)  # normalise to [0, 1]
+    peak_idx = int(np.argmax(ct))
+    n_ct = len(ct)
+
+    # Attack: frames from start to centroid peak
+    attack_ms = (peak_idx / frame_rate) * 1000.0
+    filter_env_attack_est = _ms_to_filter_env_param(attack_ms)
+
+    # Decay: frames from peak to first crossing of steady-state level
+    filter_env_decay_est = 0.3
+    if peak_idx < n_ct - 1:
+        tail = ct[peak_idx:]
+        steady = float(np.median(ct))
+        decay_frames = int(np.argmin(np.abs(tail - steady)))
+        decay_ms = (max(decay_frames, 1) / frame_rate) * 1000.0
+        filter_env_decay_est = _ms_to_filter_decay_param(decay_ms)
+
+    # Sustain: median brightness as fraction of peak
+    filter_env_sustain_est = float(np.clip(np.median(ct) / max(float(ct.max()), 1e-6), 0.0, 1.0))
+
+    # Env Amount: how much the centroid varies — high variance = more filter movement
+    if ct.mean() > 1e-8:
+        filter_env_amount_est = float(np.clip(ct.std() / ct.mean() * 0.5, 0.0, 0.5))
+    else:
+        filter_env_amount_est = 0.1
+
+    return filter_env_attack_est, filter_env_decay_est, filter_env_sustain_est, filter_env_amount_est
+
+
 # ── Feature dataclass ────────────────────────────────────────────────────────
 
 @dataclass
@@ -90,15 +162,15 @@ class TargetAnalysis:
     release_ms: float                 # estimated silence onset after note-off
 
     # Q3 — Filter
-    filter_cutoff_est: float          # [0,1] OB-Xf cutoff param suggestion
-    filter_resonance_est: float       # [0,1] OB-Xf resonance param suggestion
+    filter_cutoff_est: float          # [0,1] cutoff param suggestion
+    filter_resonance_est: float       # [0,1] resonance param suggestion
     filter_mode_est: float            # [0,1] 0=LP, 0.33=HP, 0.67=BP, 1=notch
 
     # Q4 — Modulation
     spectral_flux_norm: float         # [0,1] normalised; high = evolving timbre
-    filter_env_amount_est: float      # [0,1] OB-Xf Filter Env Amount suggestion
-    lfo_rate_est: float               # [0,1] OB-Xf LFO 1 Rate suggestion
-    lfo_to_filter_est: float          # [0,1] OB-Xf LFO 1 to Filter Cutoff
+    filter_env_amount_est: float      # [0,1] Filter Env Amount suggestion
+    lfo_rate_est: float               # [0,1] LFO 1 Rate suggestion
+    lfo_to_filter_est: float          # [0,1] LFO 1 to Filter Cutoff
 
     # Q5 — Pitch / inharmonic character
     pitch_is_stable: bool             # True if F0 is approximately constant
@@ -205,7 +277,7 @@ def analyze_target(
 
     # ── Q3: Filter parameters ────────────────────────────────────────────────
 
-    # Filter cutoff: map spectral centroid → OB-Xf cutoff parameter.
+    # Filter cutoff: map spectral centroid → cutoff parameter.
     # Uses measured calibration table from calibrate_synth.py when available;
     # falls back to heuristic linear approximation otherwise.
     filter_cutoff_est = float(_centroid_hz_to_cutoff(centroid_hz, sr))
@@ -223,7 +295,7 @@ def analyze_target(
         filter_mode_est = 0.3   # lean toward bandpass
         notes.append("filter_mode: leaning bandpass (low bass content, high centroid)")
     else:
-        filter_mode_est = 0.0   # lowpass is almost always correct for OB-Xf
+        filter_mode_est = 0.0   # lowpass is almost always correct
 
     # ── Q4: Modulation / filter envelope ────────────────────────────────────
 
@@ -245,8 +317,8 @@ def analyze_target(
     osc2_detune_est = 0.5 + float(np.clip(inharmonicity * 0.1, -0.1, 0.1))
     osc2_detune_est = float(np.clip(osc2_detune_est, 0.4, 0.6))
 
-    # ── CREPE + DDSP-style harmonic analysis ─────────────────────────────────
-    # Try CREPE for better F0, fall back to DIO inside _pyworld_analysis.
+    # ── Filter ADSR from spectral centroid trajectory ─────────────────────────
+    # Compute unconditionally via librosa; pyworld overrides when available.
     noise_volume_est         = 0.0
     filter_env_attack_est    = 0.0
     filter_env_decay_est     = 0.3
@@ -255,6 +327,22 @@ def analyze_target(
     harmonic_slope_resonance = filter_resonance_est   # start from Welch-based estimate
     f0_source                = "hps"
 
+    _CENTROID_HOP_MS = 10.0
+    ct_librosa = _centroid_trajectory(voiced.astype(np.float32), sr, hop_ms=_CENTROID_HOP_MS)
+    if ct_librosa is not None and len(ct_librosa) >= 4:
+        _frame_rate = 1000.0 / _CENTROID_HOP_MS
+        (filter_env_attack_est, filter_env_decay_est,
+         filter_env_sustain_est, filter_env_amount_est) = _filter_adsr_from_centroid(
+            ct_librosa, _frame_rate
+        )
+        # Recalculate filter_env_amount_est from trajectory (better than flux)
+        if ct_librosa.mean() > 1e-8:
+            filter_env_amount_est = float(np.clip(
+                ct_librosa.std() / ct_librosa.mean() * 0.5, 0.0, 0.5
+            ))
+        notes.append("filter_env_adsr: from librosa centroid trajectory")
+
+    # ── CREPE + pyworld harmonic analysis (overrides librosa centroid) ────────
     crepe_result = _crepe_f0(audio.astype(np.float32), sr)
     if crepe_result is not None:
         f0_ext, t_ext = crepe_result
@@ -269,34 +357,28 @@ def analyze_target(
         f0_source = "hps"
 
     if world is not None:
-        ct = world["centroid_norm"]   # per voiced frame
+        ct = world["centroid_norm"]   # per voiced frame, normalised [0,1]
 
-        # Override centroid (SP-based is more accurate than Welch)
+        # Override centroid and cutoff with higher-accuracy SP-based estimate
         spectral_centroid_norm = float(np.median(ct))
         filter_cutoff_est = float(np.clip(0.3 + spectral_centroid_norm * 0.6, 0.3, 0.90))
 
         # Noise Volume from d4c aperiodicity
         noise_volume_est = float(np.clip(world["noise_level"] * 0.8, 0.0, 0.40))
 
-        # Filter Env ADSR from spectral centroid trajectory timing
+        # Override filter ADSR with higher-accuracy pyworld SP trajectory
+        # (pyworld centroids are per voiced frame at 5ms hop, vs librosa at 10ms)
         if len(ct) >= 4:
-            peak_idx = int(np.argmax(ct))
-            n_ct     = len(ct)
-            filter_env_attack_est = _ms_to_filter_env_param(peak_idx * 5.0)
-            if peak_idx < n_ct - 1:
-                tail      = ct[peak_idx:]
-                decay_end = int(np.argmin(np.abs(tail - np.median(ct)))) + peak_idx
-                filter_env_decay_est = _ms_to_filter_env_param((decay_end - peak_idx) * 5.0)
-            filter_env_sustain_est = float(np.clip(
-                np.median(ct) / max(float(ct.max()), 1e-6), 0.0, 1.0
-            ))
+            _pw_frame_rate = 1000.0 / 5.0   # pyworld uses 5ms hop
+            (filter_env_attack_est, filter_env_decay_est,
+             filter_env_sustain_est, filter_env_amount_est) = _filter_adsr_from_centroid(
+                ct * (ct.max() + 1e-8),    # denormalise to Hz-ish for consistency
+                _pw_frame_rate,
+            )
+            notes.append("filter_env_adsr: overridden with pyworld SP centroid (5ms)")
 
         # Harmonic richness: low AP = strong harmonics
         harmonic_richness = float(np.clip(1.0 - world["noise_level"] * 2.0, 0.0, 1.0))
-
-        # Refine filter_env_amount from centroid variation (better than flux)
-        if ct.mean() > 0:
-            filter_env_amount_est = float(np.clip(ct.std() / ct.mean() * 0.5, 0.0, 0.5))
 
         # Harmonic slope resonance from per-harmonic amplitudes
         f0_world = world["f0"]
@@ -355,7 +437,7 @@ def suggest_x0(
     pinned_cols: set[str],
     current_x0: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Map analysis features to a concrete OB-Xf parameter vector.
+    """Map analysis features to a concrete synth parameter vector.
 
     Where `current_x0` is provided, the analysis-derived value is blended
     50/50 with the existing value so we don't throw away information from
@@ -382,9 +464,14 @@ def suggest_x0(
         "Filter Resonance":   analysis.harmonic_slope_resonance,
         "Filter Mode":        analysis.filter_mode_est,
         "Filter Env Amount":  analysis.filter_env_amount_est,
-        # Q2 — amp envelope (attack/decay; release is PINNED)
-        "Amp Env Attack":     _attack_ms_to_param(analysis.attack_ms),
-        "Amp Env Decay":      _decay_ms_to_param(analysis.decay_ms),
+        # Q2 — amp envelope (all four params now calibration-backed)
+        "Amp Env Attack":   _attack_ms_to_param(analysis.attack_ms),
+        "Amp Env Decay":    _decay_ms_to_param(analysis.decay_ms),
+        "Amp Env Sustain":  float(np.clip(analysis.sustain_level, 0.0, 1.0)),
+        # Release: provides a good CMA-ES starting point even while pinned in
+        # the surrogate stage. If Amp Env Release is removed from pinned_cols
+        # it will take effect directly.
+        "Amp Env Release":  _release_ms_to_param(analysis.release_ms),
         # Q4 — LFO
         "LFO 1 Rate":         analysis.lfo_rate_est,
         "LFO 1 to Filter Cutoff": analysis.lfo_to_filter_est,
@@ -585,27 +672,65 @@ def _harmonic_amplitudes(
 
 
 def _ms_to_filter_env_param(ms: float) -> float:
-    """Map envelope time (ms) to OB-Xf Filter Env param [0, 1] (log scale)."""
-    return float(np.clip(np.log10(max(ms, 1.0)) / 4.0, 0.0, 1.0))
+    """Map envelope time (ms) to Filter Env Attack param [0,1].
+    Uses calibration table when available."""
+    return _ms_to_param(ms, "filter_attack_params", "filter_attack_ms",
+                        fallback_min_ms=1.0, fallback_max_ms=5000.0)
 
 
-_FILTER_CALIB_TA: dict | None = None   # module-level cache
+def _ms_to_filter_decay_param(ms: float) -> float:
+    """Map envelope time (ms) to Filter Env Decay param [0,1].
+    Uses calibration table when available."""
+    return _ms_to_param(ms, "filter_decay_params", "filter_decay_ms",
+                        fallback_min_ms=1.0, fallback_max_ms=5000.0)
+
+
+_FILTER_CALIB_TA:  dict | None = None   # module-level cache
+_ADSR_CALIB_TA:   dict | None = None   # amp + filter envelope calibration cache
+
+
+def _load_adsr_calibration() -> dict | None:
+    """Load amp/filter ADSR calibration from defaults.CAL_PATH. Cached."""
+    global _ADSR_CALIB_TA
+    if _ADSR_CALIB_TA is None:
+        try:
+            import defaults as _defs
+            cal_path = _defs.CAL_PATH
+        except Exception:
+            cal_path = _Path(__file__).parent.parent / "s01_project-profile" / "calibration.npz"
+        if cal_path.exists():
+            d = np.load(str(cal_path))
+            _ADSR_CALIB_TA = {k: d[k].astype(np.float64) for k in d.files}
+        else:
+            _ADSR_CALIB_TA = {}
+    return _ADSR_CALIB_TA if _ADSR_CALIB_TA else None
+
+
+def _ms_to_param(ms: float, params_key: str, ms_key: str,
+                 fallback_min_ms: float = 1.0, fallback_max_ms: float = 10000.0) -> float:
+    """Interpolate ms → param [0,1] from calibration table, or log10 fallback."""
+    cal = _load_adsr_calibration()
+    if cal and params_key in cal and ms_key in cal:
+        return float(np.clip(np.interp(ms, cal[ms_key], cal[params_key]), 0.0, 1.0))
+    # Fallback: log-scale spanning fallback_min_ms → fallback_max_ms
+    ms = max(ms, fallback_min_ms)
+    span = np.log10(fallback_max_ms) - np.log10(fallback_min_ms)
+    return float(np.clip((np.log10(ms) - np.log10(fallback_min_ms)) / span, 0.0, 1.0))
 
 
 def _centroid_hz_to_cutoff(centroid_hz: float, sr: int) -> float:
-    """Map spectral centroid (Hz) → OB-Xf Filter Cutoff [0, 1].
+    """Map spectral centroid (Hz) → Filter Cutoff [0, 1].
 
     Uses measured calibration from calibrate_synth.py when available;
     falls back to heuristic linear approximation otherwise.
     """
     global _FILTER_CALIB_TA
     if _FILTER_CALIB_TA is None:
-        calib_path = _Path(__file__).parent.parent / "s07_refine" / "obxf_calibration.npz"
-        if calib_path.exists():
-            d = np.load(calib_path)
+        cal = _load_adsr_calibration()
+        if cal and "filter_cutoff_centroids_hz" in cal:
             _FILTER_CALIB_TA = {
-                "hz":   d["filter_cutoff_centroids_hz"].astype(np.float64),
-                "vals": d["filter_cutoff_values"].astype(np.float64),
+                "hz":   cal["filter_cutoff_centroids_hz"],
+                "vals": cal["filter_cutoff_values"],
             }
     if _FILTER_CALIB_TA is not None:
         return float(np.clip(
@@ -759,7 +884,7 @@ def _estimate_spectral_dynamics(
     """Return (spectral_flux_norm, lfo_rate_est).
 
     spectral_flux_norm: how much the spectrum changes frame-to-frame, in [0,1].
-    lfo_rate_est: OB-Xf LFO Rate param suggestion (0=slow, 1=fast).
+    lfo_rate_est: LFO Rate param suggestion (0=slow, 1=fast).
     """
     n_frames = max(1, (len(audio) - win) // hop + 1)
     if n_frames < 3:
@@ -789,7 +914,7 @@ def _estimate_spectral_dynamics(
     # LFO rate: if centroid oscillates at a sub-audio rate, estimate it.
     # Simple autocorrelation peak detection on centroid sequence.
     lfo_rate_hz = _estimate_lfo_rate(centroids, hop / sr)
-    # Map Hz → OB-Xf LFO Rate param [0,1]. OB-Xf LFO range ≈ 0.1–30 Hz.
+    # Map Hz → LFO Rate param [0,1]. Range ≈ 0.1–30 Hz.
     if lfo_rate_hz > 0:
         lfo_rate_est = float(np.clip(np.log10(max(lfo_rate_hz, 0.1)) / np.log10(30.0), 0.0, 1.0))
     else:
@@ -846,23 +971,24 @@ def _detect_transient_min_ms(audio: np.ndarray, sr: int) -> float:
 
 
 def _attack_ms_to_param(attack_ms: float) -> float:
-    """Map measured attack time to OB-Xf Amp Env Attack param [0,1].
-
-    OB-Xf attack range is approximately 1ms (param=0.0) to 10s (param=1.0)
-    with roughly logarithmic scaling.
-    """
-    attack_ms = max(attack_ms, 1.0)
-    # log-scale: 1ms→0.0, 10ms→0.15, 100ms→0.4, 1000ms→0.65, 10000ms→1.0
-    log_val = np.log10(attack_ms)          # 0 → 4
-    param = float(np.clip(log_val / 4.0, 0.0, 1.0))
-    return param
+    """Map measured attack time (ms) to Amp Env Attack param [0,1].
+    Uses calibration table (42ms–2953ms measured); falls back to log10 heuristic."""
+    return _ms_to_param(attack_ms, "amp_attack_params", "amp_attack_ms",
+                        fallback_min_ms=1.0, fallback_max_ms=10000.0)
 
 
 def _decay_ms_to_param(decay_ms: float) -> float:
-    """Map measured decay time to OB-Xf Amp Env Decay param [0,1]."""
-    decay_ms = max(decay_ms, 1.0)
-    log_val = np.log10(decay_ms)
-    return float(np.clip(log_val / 4.0, 0.0, 1.0))
+    """Map measured decay time (ms) to Amp Env Decay param [0,1].
+    Uses calibration table (5ms–12000ms measured); falls back to log10 heuristic."""
+    return _ms_to_param(decay_ms, "amp_decay_params", "amp_decay_ms",
+                        fallback_min_ms=1.0, fallback_max_ms=15000.0)
+
+
+def _release_ms_to_param(release_ms: float) -> float:
+    """Map measured release time (ms) to Amp Env Release param [0,1].
+    Uses calibration table (4ms–12000ms measured); falls back to log10 heuristic."""
+    return _ms_to_param(release_ms, "amp_release_params", "amp_release_ms",
+                        fallback_min_ms=1.0, fallback_max_ms=15000.0)
 
 
 # ── Pretty-print ─────────────────────────────────────────────────────────────
@@ -877,10 +1003,10 @@ def print_analysis(a: TargetAnalysis) -> None:
     print(f"     Spectral flatness   {a.spectral_flatness:.3f}  (0=tonal 1=noise)")
     print(f"     Fundamental         {a.fundamental_hz:.1f}Hz" if a.fundamental_hz else "     Fundamental         none detected")
     print(f"  Q2 Amp ADSR:")
-    print(f"     Attack              {a.attack_ms:.1f}ms  → param {_attack_ms_to_param(a.attack_ms):.2f}")
-    print(f"     Decay               {a.decay_ms:.1f}ms  → param {_decay_ms_to_param(a.decay_ms):.2f}")
-    print(f"     Sustain level       {a.sustain_level:.2f}")
-    print(f"     Release             {a.release_ms:.1f}ms  (pinned to 0.2 in render)")
+    print(f"     Attack              {a.attack_ms:.1f}ms  → param {_attack_ms_to_param(a.attack_ms):.3f}")
+    print(f"     Decay               {a.decay_ms:.1f}ms  → param {_decay_ms_to_param(a.decay_ms):.3f}")
+    print(f"     Sustain level       {a.sustain_level:.2f}  → param {a.sustain_level:.3f}")
+    print(f"     Release             {a.release_ms:.1f}ms  → param {_release_ms_to_param(a.release_ms):.3f}")
     print(f"  Q3 Filter:")
     print(f"     Cutoff estimate     {a.filter_cutoff_est:.2f}")
     print(f"     Resonance estimate  {a.filter_resonance_est:.2f}")

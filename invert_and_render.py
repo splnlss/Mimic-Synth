@@ -167,7 +167,8 @@ def render_best_patch(best_patch, profile, run_dir):
     
     try:
         engine = daw.RenderEngine(SR, BUFFER)
-        synth = engine.make_plugin_processor("obxf", str(plugin_path))
+        synth_id = profile.get("synth", {}).get("id", "synth")
+        synth = engine.make_plugin_processor(synth_id, str(plugin_path))
         n = synth.get_plugin_parameter_size()
         name_idx = {synth.get_parameter_name(i): i for i in range(n)}
         

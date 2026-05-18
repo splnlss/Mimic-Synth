@@ -14,7 +14,7 @@ Usage:
     python -m s06_invert.invert \\
         --target path/to/target.wav \\
         --surrogate s05_surrogate/runs/run_20260429_145056/state_dict.pt \\
-        --profile s01_profiles/obxf.yaml \\
+        --profile path/to/profile.yaml \\
         --out patches/
 """
 from __future__ import annotations

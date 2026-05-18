@@ -1,6 +1,6 @@
 """Shared render + score helpers for s07 refinement strategies.
 
-Renders a per-frame parameter trajectory through OB-Xf via DawDreamer and
+Renders a per-frame parameter trajectory through the VST via DawDreamer and
 scores the result against a target embedding. Each render allocates a fresh
 DawDreamer engine + plugin so there is no patch bleed between candidates;
 this matches the s06b refinement loop's behaviour.
@@ -47,6 +47,66 @@ _MRSTFT_LOSS.eval()
 _TARGET_LUFS: float = -23.0
 
 
+def _load_calibration() -> dict:
+    """Load calibration.npz once and cache it. Reads path from defaults.CAL_PATH."""
+    if not hasattr(_load_calibration, "_cache"):
+        try:
+            import defaults as _defs
+            cal_path = _defs.CAL_PATH
+        except Exception:
+            cal_path = _Path(__file__).parent / "calibration.npz"
+        if cal_path.exists():
+            with np.load(str(cal_path)) as f:
+                _load_calibration._cache = {k: f[k] for k in f.files}
+        else:
+            _load_calibration._cache = {}
+    return _load_calibration._cache
+
+
+def _interp_ms(param_val: float, params_key: str, ms_key: str,
+               fallback_fn) -> float:
+    """Interpolate a param → ms mapping from the calibration table, or fall back."""
+    cal = _load_calibration()
+    if params_key in cal and ms_key in cal:
+        ms = float(np.interp(float(param_val), cal[params_key], cal[ms_key]))
+        return max(0.001, ms / 1000.0)
+    return fallback_fn(param_val)
+
+
+def amp_release_sec(param_val: float) -> float:
+    """Amp Env Release param [0,1] → seconds.
+
+    Uses calibration table when available (run calibrate_synth.py --amp-adsr).
+    Falls back to a quadratic empirical estimate: 0.2 → ~0.20s, 1.0 → ~5s.
+    """
+    return _interp_ms(param_val, "amp_release_params", "amp_release_ms",
+                      lambda p: max(0.01, 5.0 * float(p) ** 2))
+
+
+def amp_attack_sec(param_val: float) -> float:
+    """Amp Env Attack param [0,1] → seconds. Uses calibration table when available."""
+    return _interp_ms(param_val, "amp_attack_params", "amp_attack_ms",
+                      lambda p: max(0.001, 3.0 * float(p) ** 2))
+
+
+def amp_decay_sec(param_val: float) -> float:
+    """Amp Env Decay param [0,1] → seconds. Uses calibration table when available."""
+    return _interp_ms(param_val, "amp_decay_params", "amp_decay_ms",
+                      lambda p: max(0.001, 8.0 * float(p) ** 2))
+
+
+def filter_attack_sec(param_val: float) -> float:
+    """Filter Env Attack param [0,1] → seconds. Uses calibration table when available."""
+    return _interp_ms(param_val, "filter_attack_params", "filter_attack_ms",
+                      lambda p: max(0.001, 3.0 * float(p) ** 2))
+
+
+def filter_decay_sec(param_val: float) -> float:
+    """Filter Env Decay param [0,1] → seconds. Uses calibration table when available."""
+    return _interp_ms(param_val, "filter_decay_params", "filter_decay_ms",
+                      lambda p: max(0.001, 8.0 * float(p) ** 2))
+
+
 def _lufs_normalize(audio: np.ndarray, sr: int) -> np.ndarray:
     """Normalize audio to -23 LUFS (ITU-R BS.1770) via pyloudnorm.
 
@@ -75,10 +135,11 @@ def _lufs_normalize(audio: np.ndarray, sr: int) -> np.ndarray:
 # MRSTFT: temporal spectral variation — filter sweeps, attack/release character.
 # AP (aperiodicity): noise-vs-harmonic balance — "squaky", breathy, inharmonic content.
 # When a term is unavailable (e.g. pyworld not installed), weights are renormalised.
-ENCODEC_WEIGHT: float = 0.40  # roadmap §III.A revised weights
-MRSTFT_WEIGHT:  float = 0.25
-AP_WEIGHT:      float = 0.20
-SP_WEIGHT:      float = 0.15  # per-frame spectral envelope (pyworld CheapTrick)
+ENCODEC_WEIGHT: float = 0.36  # roadmap §III.A revised weights
+MRSTFT_WEIGHT:  float = 0.23
+AP_WEIGHT:      float = 0.18
+SP_WEIGHT:      float = 0.13  # per-frame spectral envelope (pyworld CheapTrick)
+ENV_WEIGHT:     float = 0.10  # amplitude envelope correlation (attack/sustain/release shape)
 
 
 _MRSTFT_N_TERMS = 2 * len([256, 512, 1024, 2048])  # SpectralConvergence + LogMagnitude per scale = 8
@@ -189,6 +250,46 @@ def _cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
     return float(1.0 - F.cosine_similarity(ta.unsqueeze(0), tb.unsqueeze(0)))
 
 
+def compute_envelope(audio: np.ndarray, sr: int, hop_ms: float = 5.0) -> np.ndarray:
+    """Amplitude envelope via 5ms RMS frames. Returns float32 array [n_frames]."""
+    hop = max(1, int(hop_ms / 1000 * sr))
+    win = hop * 2
+    n_frames = max(1, (len(audio) - win) // hop + 1)
+    env = np.array([
+        float(np.sqrt(np.mean(audio[i * hop: i * hop + win] ** 2)))
+        for i in range(n_frames)
+    ], dtype=np.float32)
+    peak = env.max()
+    return env / (peak + 1e-8)
+
+
+def _envelope_dist(audio_a: np.ndarray, audio_b: np.ndarray, sr: int) -> float:
+    """1 − Pearson correlation of amplitude envelopes, in [0, 2].
+
+    Rewards matching attack shape, sustain plateau, and release curve.
+    Returns 1.0 (neutral) for very short clips or silent inputs.
+    """
+    if len(audio_a) < sr * 0.05 or len(audio_b) < sr * 0.05:
+        return 1.0
+    env_a = compute_envelope(audio_a, sr)
+    env_b = compute_envelope(audio_b, sr)
+    n = min(len(env_a), len(env_b))
+    if n < 4:
+        return 1.0
+    # Resample the longer envelope to match the shorter
+    if len(env_a) != len(env_b):
+        env_b = np.interp(
+            np.linspace(0, 1, n),
+            np.linspace(0, 1, len(env_b[:n]) if len(env_b) > n else len(env_b)),
+            env_b[:n] if len(env_b) > n else env_b,
+        ).astype(np.float32)
+        env_a = env_a[:n]
+    corr = float(np.corrcoef(env_a, env_b)[0, 1])
+    if not np.isfinite(corr):
+        return 1.0
+    return float(np.clip(1.0 - corr, 0.0, 2.0))
+
+
 def score_audio_composite(
     audio: np.ndarray,
     sr: int,
@@ -198,14 +299,16 @@ def score_audio_composite(
     target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
     target_sp: np.ndarray | None = None,
+    target_env: np.ndarray | None = None,
 ) -> float:
-    """Composite score: EnCodec + MRSTFT + AP + SP, renormalised (roadmap §III.A).
+    """Composite score: EnCodec + MRSTFT + AP + SP + Env, renormalised (roadmap §III.A).
 
     Active terms and their base weights:
-        EnCodec  40%  — high-level timbral color and resonance
-        MRSTFT   25%  — filter movement, temporal spectral variation (auraloss)
-        AP       20%  — noise-vs-harmonic balance (squaky, breathy quality)
-        SP       15%  — per-frame spectral envelope match (pyworld CheapTrick)
+        EnCodec  38%  — high-level timbral color and resonance
+        MRSTFT   24%  — filter movement, temporal spectral variation (auraloss)
+        AP       19%  — noise-vs-harmonic balance (squaky, breathy quality)
+        SP       14%  — per-frame spectral envelope match (pyworld CheapTrick)
+        Env      10%  — amplitude envelope correlation (attack/sustain/release shape)
 
     Inactive terms (None) are dropped and remaining weights are renormalised
     so the score always has a consistent scale ∈ [0, 2].
@@ -228,6 +331,12 @@ def score_audio_composite(
         if cand_sp is not None:
             terms.append((SP_WEIGHT, _sp_dist(target_sp, cand_sp)))
 
+    # Envelope distance: use target_env if provided, else fall back to
+    # target_mrstft_audio (which is always the raw target audio).
+    _env_ref = target_env if target_env is not None else target_mrstft_audio
+    if _env_ref is not None:
+        terms.append((ENV_WEIGHT, _envelope_dist(audio, _env_ref, sr)))
+
     total_w = sum(w for w, _ in terms)
     return sum(w / total_w * d for w, d in terms)
 
@@ -244,7 +353,7 @@ def render_trajectory(
 
     Applies all reset values from the profile first so the synth starts from
     a known state on every render. This is critical for parameter comparisons:
-    without it, OB-Xf's internal defaults (e.g. saw wave on/off) may differ
+    without it, the plugin's internal defaults (e.g. saw wave on/off) may differ
     between render calls.
 
     Args:
@@ -286,7 +395,7 @@ def render_trajectory(
     name_to_idx = {plugin.get_parameter_name(i): i for i in range(num_params)}
 
     # Apply profile reset values to establish a known starting state.
-    # Without this, OB-Xf falls back to an undefined internal default for
+    # Without this, the plugin falls back to an undefined internal default for
     # any parameter we don't explicitly set.
     for name, val in reset_values.items():
         if name in name_to_idx:
@@ -298,14 +407,18 @@ def render_trajectory(
             if name in name_to_idx:
                 plugin.set_parameter(name_to_idx[name], float(val))
 
-    # Per-region MIDI note-on/off. Note-off lands at next region's onset (or
-    # at this region's offset for the final region). Matches s06b semantics.
+    # Per-region MIDI note-on/off. Note-off is pulled back by amp_release_sec
+    # so the release tail *ends* at the intended boundary rather than starting
+    # there. Without this the rendered note overshoots every region endpoint.
+    _rel_param = float(df["p_Amp Env Release"].median()) if "p_Amp Env Release" in df.columns else 0.2
+    _rel_sec   = amp_release_sec(_rel_param)
     for i, r in enumerate(note_regions):
         note_on = r["onset_sec"]
         if i < len(note_regions) - 1:
-            note_off = note_regions[i + 1]["onset_sec"]
+            raw_off = note_regions[i + 1]["onset_sec"]
         else:
-            note_off = r["offset_sec"]
+            raw_off = r["offset_sec"]
+        note_off = max(note_on + 0.001, raw_off - _rel_sec)
         dur = max(0.0, note_off - note_on)
         if dur > 0:
             plugin.add_midi_note(r["midi_note"], 100, note_on, dur)
@@ -462,11 +575,12 @@ def render_and_score(
     target_mrstft_audio: np.ndarray | None = None,
     target_ap: np.ndarray | None = None,
     target_sp: np.ndarray | None = None,
+    target_env: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """Convenience: render `df` and return (score, audio)."""
     audio, sr = render_trajectory(
         df, note_regions, param_cols, profile_path, total_sec, extra_params
     )
     score = score_audio_composite(audio, sr, target_emb_t, embedder, device,
-                                  target_mrstft_audio, target_ap, target_sp)
+                                  target_mrstft_audio, target_ap, target_sp, target_env)
     return score, audio

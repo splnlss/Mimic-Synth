@@ -18,8 +18,8 @@ Two-step migration to a `src` layout with consistent stage numbering across repo
 | `s01_profiles/` | _(moves to project as `profile.yaml`)_ | — | — |
 | `s02_capture/` | `src/mimic_synth/s01_capture/` | `s02_capture/` | `s01_capture/` |
 | `s03_dataset/` | `src/mimic_synth/s02_dataset/` | `s03_dataset/` | `s02_dataset/` |
-| `s04_embed/` | `src/mimic_synth/s03_embed/` | `s04_embed/` | `s03_embed/` |
-| `s05_surrogate/` | `src/mimic_synth/s04_surrogate/` | `s05_surrogate/` | `s04_surrogate/` |
+| `s04_embed/` | `src/mimic_synth/s03_embed/` | `s04_embed/` | `s03_embed/` (EnCodec + optional CLAP + optional MRSTFT) |
+| `s05_surrogate/` | `src/mimic_synth/s04_surrogate/` | `s05_surrogate/` | `s04_surrogate/` (FiLM+ResBlocks arch; `SurrogateMRSTFTHead` training-only) |
 | `s06_invert/` + `s06b_live/` | `src/mimic_synth/s05_invert/` | _(output only)_ | `outputs/` |
 | `s07_refine/` | `src/mimic_synth/s06_refine/` | _(output only)_ | `outputs/` |
 | `defaults.py` | `src/mimic_synth/config.py` | — | `project.yaml` |
@@ -55,13 +55,13 @@ src/
       verify_dataset.py
     s03_embed/               (was s04_embed/)
       __init__.py
-      embed.py
-      index_dataset.py
+      embed.py               (EnCodec 48kHz + LAION-CLAP 512-d + MRSTFT feats)
+      index_dataset.py       (--embed-model encodec/clap, --mrstft)
       verify_embeddings.py
     s04_surrogate/           (was s05_surrogate/)
       __init__.py
-      model.py
-      train.py
+      model.py               (FiLMResBlock, Surrogate, SurrogateMRSTFTHead, SurrogateDataset)
+      train.py               (--film/--no-film, --hidden-dim, --embed-model, --mrstft-features, cosine LR)
       verify_surrogate.py
     s05_invert/              (merge of s06_invert/ + s06b_live/)
       __init__.py
@@ -149,8 +149,10 @@ S01_PARQUET = S01_DIR / "samples.parquet"
 S02_DIR     = PROJECT_DIR / "s02_dataset"
 S02_PARQUET = S02_DIR / "samples.parquet"
 
-S03_DIR        = PROJECT_DIR / "s03_embed"
-S03_EMBEDDINGS = S03_DIR / "encodec_embeddings.npy"
+S03_DIR             = PROJECT_DIR / "s03_embed"
+S03_EMBEDDINGS      = S03_DIR / "encodec_embeddings.npy"
+S03_CLAP_EMBEDDINGS = S03_DIR / "clap_embeddings.npy"
+S03_MRSTFT_FEATS    = S03_DIR / "mrstft_features.npy"
 
 S04_DIR      = PROJECT_DIR / "s04_surrogate"
 S04_RUNS_DIR = S04_DIR / "runs"
@@ -272,8 +274,18 @@ build:
 embed:
 	$(CONDA) mimic-embed --pool mean --batch-size 64
 
+embed-clap:
+	$(CONDA) mimic-embed --embed-model clap
+
+embed-mrstft:
+	$(CONDA) mimic-embed --pool mean --batch-size 64 --mrstft
+
 train:
 	$(CONDA) mimic-train
+
+train-clap:
+	$(CONDA) mimic-train --embed-model clap \
+	    --embeddings $(shell $(CONDA) python -c "import defaults as d; print(d.S03_CLAP_EMBEDDINGS)")
 
 invert:
 	$(CONDA) mimic-invert --target $(TARGET)
@@ -460,9 +472,14 @@ OB-X_Prototype/
   s03_embed/
     encodec_embeddings.npy
     encodec_embeddings_done.npy
+    clap_embeddings.npy        (optional — produced by --embed-model clap)
+    clap_embeddings_done.npy   (optional)
+    mrstft_features.npy        (optional — produced by --mrstft)
+    mrstft_features_done.npy   (optional)
   s04_surrogate/
     runs/
-      run_20260429_145056/   (stale — retrain after s03 rebuild)
+      run_20260429_145056/   (legacy — 4-layer MLP, hidden_dim=512, encodec)
+      run_<timestamp>/       (FiLM+ResBlocks, hidden_dim=1024, encodec — retrain after s03 rebuild)
     obxf_calibration.npz
   inputs/                    (was targets/)
     crane-scream.wav
@@ -567,8 +584,9 @@ mimic-invert --target /mnt/d/Mimic-Synth-Data/OB-X_Prototype/inputs/crane-scream
 | No Tech Stack section | Missing |
 | No Contributing section | Missing |
 | `defaults.py` referenced throughout — stale after Step 1 | Lines 43–48 |
-| All `python -m s0N_xxx` commands stale after Step 1 | Lines 109, 115, 122, 129–135, 148–149, etc. |
+| All `python -m s0N_xxx` commands stale after Step 1 | Lines 109, 115, 122, 129–149, etc. (S05 section expanded for FiLM) |
 | `conda run -n mimic-synth python -m s06b_live...` stale | Lines 195, 204, 213 |
+| Surrogate described as "4-layer MLP" | Updated in current README; Step 3 rewrite should foreground FiLM arch |
 | Stage folder paths (`s02_capture/`, `s06b_live/`) stale after Steps 1–2 | Lines 9–17, 268–334 |
 | Algorithm diagrams (S06b, S07 ASCII flowcharts) — excellent but too early | Lines 370–451 |
 | Quality roadmap at the bottom — useful but deeply nested | Lines 462–497 |
@@ -635,7 +653,7 @@ Bullet list of what makes MimicSynth stand out — written for someone who found
 
 - **Full inversion pipeline** — from raw audio to synth patch in under 30 seconds (fast mode) or ~15 minutes (full CMA-ES quality)
 - **Synth-agnostic design** — profile YAML describes any VST or hardware synth; only the profile changes between instruments
-- **Surrogate neural network** — differentiable proxy for the synth trained on Sobol-sampled patches; enables gradient-based search without rendering through the VST
+- **Surrogate neural network** — FiLM+ResBlocks MLP with per-layer note conditioning (γ/β projections); differentiable proxy enabling gradient-based search without rendering through the VST. Optional MRSTFT auxiliary spectral loss during training. Supports EnCodec (128-d) or CLAP (512-d) embedding targets.
 - **Real-VST refinement** — CMA-ES closes the surrogate-to-real gap by evaluating every candidate through the actual plugin
 - **Oscillator config and interval scouting** — discrete outer search over waveform types and Osc 2 pitch intervals before continuous CMA-ES
 - **Composite scoring** — EnCodec 40% + auraloss MRSTFT 25% + aperiodicity 20% + spectral envelope 15%, all LUFS-normalised
@@ -654,7 +672,8 @@ Table covering every major dependency with a one-line reason for use:
 |---|---|
 | [DawDreamer](https://github.com/DBraun/DawDreamer) | Headless VST host — renders audio from plugin + MIDI + automation |
 | [EnCodec](https://github.com/facebookresearch/encodec) | 128-d audio embeddings (48 kHz pre-quantiser latents) as perceptual distance metric |
-| [auraloss](https://github.com/csteinmetz1/auraloss) | Multi-resolution STFT loss for composite scoring |
+| [LAION-CLAP](https://github.com/LAION-AI/CLAP) | Optional 512-d audio embeddings for surrogate training (`--embed-model clap`) |
+| [auraloss](https://github.com/csteinmetz1/auraloss) | Multi-resolution STFT loss — scoring (S07) and auxiliary surrogate training loss (S05) |
 | [pyworld](https://github.com/JeremyCCHsu/Python-WORLD) | F0/aperiodicity/spectral envelope analysis (WORLD vocoder) |
 | [cma](https://github.com/CMA-ES/pycma) | CMA-ES optimiser for real-VST parameter search |
 | [pyloudnorm](https://github.com/csteinmetz1/pyloudnorm) | LUFS normalisation before all scoring comparisons |
@@ -921,7 +940,11 @@ Every command in the README must be updated. Full mapping:
 | `python -m s03_dataset.verify_dataset` | `mimic-verify-dataset` or `make verify-dataset` |
 | `python -m s04_embed.index_dataset --pool mean --batch-size 64` | `mimic-embed --pool mean --batch-size 64` or `make embed` |
 | `python -m s04_embed.verify_embeddings` | `mimic-verify-embeddings` or `make verify-embeddings` |
-| `python -m s05_surrogate.train` | `mimic-train` or `make train` |
+| `python -m s05_surrogate.train` | `mimic-train` or `make train` (FiLM+ResBlocks, hidden_dim=1024 by default) |
+| `python -m s05_surrogate.train --no-film --hidden-dim 512` | `mimic-train --no-film --hidden-dim 512` (legacy MLP) |
+| `python -m s05_surrogate.train --embed-model clap --embeddings ...` | `make train-clap` |
+| `python -m s04_embed.index_dataset --embed-model clap` | `make embed-clap` |
+| `python -m s04_embed.index_dataset --pool mean --batch-size 64 --mrstft` | `make embed-mrstft` |
 | `python -m s05_surrogate.verify_surrogate` | `mimic-verify-surrogate` or `make verify-surrogate` |
 | `conda run -n mimic-synth python -m s06b_live.stream_invert --target X --hill-iterations 0` | `mimic-invert --target X --hill-iterations 0` |
 | `conda run -n mimic-synth python -m s06b_live.stream_invert --target X` | `mimic-invert --target X` |

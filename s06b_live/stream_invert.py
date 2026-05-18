@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-stream_invert.py — Streaming audio-to-parameter inversion for OB-Xf.
+stream_invert.py — Streaming audio-to-parameter inversion.
 
 v4 changes:
   - Fine-grained note segmentation: energy + pitch-discontinuity detection at 10 ms
@@ -290,7 +290,7 @@ def _write_pitch_bend_midi(
     Pitch bend affects ALL oscillators simultaneously (unlike Osc 1 Pitch which
     only moves Osc 1). Both Osc 1 and Osc 2 track the source pitch together.
 
-    Calibration (measured against OB-Xf):
+    Calibration (measured):
         Pitch Bend Up/Down param = 0.042 → ±2.06 semitones at full bend (±8192).
         pb_range_param = 0.042 * (pb_range_st / 2.06)
 
@@ -309,7 +309,7 @@ def _write_pitch_bend_midi(
     except ImportError:
         return None
 
-    # Calibrated from OB-Xf measurement: 0.042 → 2.06 st at full ±8192 deflection.
+    # Calibrated measurement: 0.042 → 2.06 st at full ±8192 deflection.
     PB_CALIB = 2.06 / 0.042       # semitones per param unit
     pb_range_param = pb_range_st / PB_CALIB
 
@@ -392,14 +392,18 @@ _FILTER_CALIB: dict | None = None   # module-level cache; loaded once on first c
 
 
 def _centroid_hz_to_filter_cutoff(centroid_hz: np.ndarray, sr: int) -> np.ndarray:
-    """Map spectral centroid Hz → OB-Xf Filter Cutoff [0, 1].
+    """Map spectral centroid Hz → Filter Cutoff [0, 1].
 
     Uses the measured calibration table from calibrate_synth.py when available;
     falls back to heuristic linear approximation otherwise.
     """
     global _FILTER_CALIB
     if _FILTER_CALIB is None:
-        calib_path = Path(__file__).parent.parent / "s07_refine" / "obxf_calibration.npz"
+        try:
+            import defaults as _defs
+            calib_path = _defs.CAL_PATH
+        except Exception:
+            calib_path = Path(__file__).parent.parent / "s01_project-profile" / "calibration.npz"
         if calib_path.exists():
             d = np.load(calib_path)
             _FILTER_CALIB = {
@@ -542,7 +546,7 @@ def _compute_fine_pitch_trajectory(
     to reproduce fine pitch glides (within-region bends, release drops, etc.)
     that coarser tracking and fixed MIDI notes cannot capture.
 
-    Pitch range: OB-Xf Osc 1 Pitch is ±24 semitones (0.5=center). A glide
+    Pitch range: Osc 1 Pitch is ±24 semitones (0.5=center). A glide
     from 1109Hz to 950Hz on MIDI note 85 corresponds to:
         offset = -2.66 semitones → osc1_pitch ≈ 0.5 - 2.66/48 ≈ 0.444
     """
@@ -592,7 +596,7 @@ def _compute_fine_pitch_trajectory(
 #
 # Why each is pinned:
 #   "Osc 1 Pitch" → 0.5 (centre, no transposition)
-#       OB-Xf's Osc 1 Pitch is a ±24-semitone transpose. The surrogate
+#       Osc 1 Pitch is a ±24-semitone transpose. The surrogate
 #       happily pushes this to 1.0 (+24 st) to match the embedding, which
 #       shifts a MIDI 85 (1109 Hz) target up to ~4.5 kHz. We send the exact
 #       MIDI note to DawDreamer (see surrogate_note vs midi_note logic),
@@ -626,8 +630,7 @@ def _pinned_indices(param_cols: list[str]) -> dict[int, float]:
 
 # ── Pitch → MIDI pitch bend + Osc 1 Pitch ────────────────────────────────────
 
-# OB-Xf Osc 1 Pitch is a ±24-semitone transpose: 0.0 = -24st, 0.5 = center, 1.0 = +24st.
-# (Confirmed: surrogate pushing to 1.0 shifts MIDI 85 / 1109Hz to ~4.4kHz = +24 semitones.)
+# Osc 1 Pitch is a ±24-semitone transpose: 0.0 = -24st, 0.5 = center, 1.0 = +24st.
 OSC1_PITCH_RANGE_SEMITONES = 24.0
 MIDI_PITCH_BEND_RANGE_SEMITONES = 2.0  # ±2 semitones via MIDI pitch bend
 
@@ -768,7 +771,9 @@ def stream_invert(
     hill_iterations: int = 2,
     hill_offsets: tuple[float, ...] = (-0.15, -0.05, 0.05, 0.15),
     run_cmaes: bool = False,
-    cmaes_mode: str = "hybrid",     # "global" | "per-region" | "hybrid"
+    cmaes_mode: str = "hybrid",           # "global" | "per-region" | "hybrid"
+    cmaes_osc_config: str | None = None,  # None = scout; "saw"/"pulse"/"saw+pulse" = force
+    cmaes_all_configs: bool = False,      # run all 3 configs and render each
     cmaes_popsize: int = 16,
     cmaes_maxiter: int = 20,
     cmaes_sigma0: float = 0.08,
@@ -1095,6 +1100,8 @@ def stream_invert(
                 device=device,
                 audio_duration=audio_duration,
                 mode=cmaes_mode,
+                force_osc_config=cmaes_osc_config,
+                all_osc_configs=cmaes_all_configs,
                 sigma0=cmaes_sigma0,
                 popsize=cmaes_popsize,
                 maxiter=cmaes_maxiter,
@@ -1143,7 +1150,7 @@ def _render_stream(
     # This gives true pitch bend affecting ALL oscillators simultaneously,
     # unlike the Osc 1 Pitch VST automation which only moves Osc 1.
     #
-    # Pitch bend range calibration (measured against OB-Xf):
+    # Pitch bend range calibration (measured):
     #   Pitch Bend Up/Down = 0.042 → ±2.06 semitones at full bend (±8192 MIDI).
     fine_traj_path = out_dir / "fine_pitch_trajectory.yaml"
     midi_generated = False
@@ -1178,12 +1185,16 @@ def _render_stream(
 
     if not midi_generated:
         # Fallback: add_midi_note without pitch bend
+        from s07_refine.audio_compare import amp_release_sec as _arc
+        _rel_param = float(df["p_Amp Env Release"].median()) if "p_Amp Env Release" in df.columns else 0.2
+        _rel_sec   = _arc(_rel_param)
         for i, r in enumerate(note_regions):
             note_on = r["onset_sec"]
             if i < len(note_regions) - 1:
-                note_off = note_regions[i + 1]["onset_sec"]
+                raw_off = note_regions[i + 1]["onset_sec"]
             else:
-                note_off = r["offset_sec"]
+                raw_off = r["offset_sec"]
+            note_off = max(note_on + 0.001, raw_off - _rel_sec)
             note_dur = max(0.0, note_off - note_on)
             if note_dur > 0:
                 plugin.add_midi_note(r["midi_note"], 100, note_on, note_dur)
@@ -1286,9 +1297,13 @@ def _refine_loop(
         num_params = plugin.get_plugin_parameter_size()
         pn2i = {plugin.get_parameter_name(i): i for i in range(num_params)}
 
+        from s07_refine.audio_compare import amp_release_sec as _arc
+        _rel_param = float(current_df["p_Amp Env Release"].median()) if "p_Amp Env Release" in current_df.columns else 0.2
+        _rel_sec   = _arc(_rel_param)
         for i, r in enumerate(note_regions):
-            note_on = r["onset_sec"]
-            note_off = note_regions[i + 1]["onset_sec"] if i < len(note_regions) - 1 else r["offset_sec"]
+            note_on  = r["onset_sec"]
+            raw_off  = note_regions[i + 1]["onset_sec"] if i < len(note_regions) - 1 else r["offset_sec"]
+            note_off = max(note_on + 0.001, raw_off - _rel_sec)
             dur = max(0.0, note_off - note_on)
             if dur > 0:
                 plugin.add_midi_note(r["midi_note"], 100, note_on, dur)
@@ -1457,7 +1472,7 @@ def _hill_climb_step(
     target_ap = compute_ap_features(target_audio, sr)
     target_sp = compute_sp_features(target_audio, int(sr))
 
-    active = "EnCodec+MRSTFT" + ("+AP" if target_ap is not None else "")
+    active = "EnCodec+MRSTFT+Env" + ("+AP" if target_ap is not None else "")
     df = pd.read_parquet(run_dir / "stream_params.parquet")
     timestamps = df["timestamp"].values
     hop_sec = timestamps[1] - timestamps[0] if len(timestamps) > 1 else 0.05
@@ -1534,6 +1549,8 @@ def _cmaes_step(
     device: str,
     audio_duration: float,
     mode: str = "hybrid",
+    force_osc_config: str | None = None,
+    all_osc_configs: bool = False,
     sigma0: float = 0.08,
     popsize: int = 16,
     maxiter: int = 20,
@@ -1577,47 +1594,63 @@ def _cmaes_step(
     hop_sec = timestamps[1] - timestamps[0] if len(timestamps) > 1 else 0.05
     total_sec = audio_duration if audio_duration else timestamps[-1] + hop_sec
 
-    print(f"\n=== CMA-ES refinement (mode={mode}, popsize={popsize}, maxiter={maxiter}) ===")
-
-    # Checkpoint: write rendered.wav whenever CMA-ES finds a new best score.
-    # Called by _run_global via _ipop_cmaes at each IPOP restart improvement.
     from s07_refine.audio_compare import render_trajectory as _render_trajectory
+    from s07_refine.vst_cmaes import OSC_CONFIGS as _OSC_CONFIGS
+
+    _SLOW_PARAMS = ["p_Ring Mod Volume", "p_Cross Modulation"]
+
+    def _smooth_result(r):
+        for _col in _SLOW_PARAMS:
+            if _col in r.best_df.columns:
+                r.best_df[_col] = smooth_trajectory(r.best_df[_col].values, 7)
+        return r
 
     def _cmaes_checkpoint(ckpt_df: "pd.DataFrame", score: float) -> None:
         try:
             audio_ckpt, sr_ckpt = _render_trajectory(
-                ckpt_df, note_regions, list(ckpt_df.columns),
-                profile_path, total_sec,
+                ckpt_df, note_regions, list(ckpt_df.columns), profile_path, total_sec,
             )
             sf.write(str(run_dir / "rendered.wav"), audio_ckpt.T, sr_ckpt)
             print(f"  [ckpt] CMA-ES new best {score:.4f} → rendered.wav updated")
         except Exception as _e:
             print(f"  [ckpt] skipped ({_e})")
 
-    result = cmaes_refine(
-        df=df,
-        note_regions=note_regions,
-        param_cols=param_cols,
-        pinned_cols=pinned_cols,
-        profile_path=profile_path,
-        total_sec=total_sec,
-        target_wav=target_wav,
-        embedder=embedder,
-        device=device,
-        mode=mode,
-        sigma0=sigma0,
-        popsize=popsize,
-        maxiter=maxiter,
-        on_improvement=_cmaes_checkpoint,
+    _shared_kwargs = dict(
+        df=df, note_regions=note_regions, param_cols=param_cols,
+        pinned_cols=pinned_cols, profile_path=profile_path, total_sec=total_sec,
+        target_wav=target_wav, embedder=embedder, device=device,
+        mode=mode, sigma0=sigma0, popsize=popsize, maxiter=maxiter,
         analysis=analysis,
     )
 
-    # Smooth ring-mod params with a longer window to prevent high-freq aliasing
-    # at region boundaries (extra CMA-ES params are not covered by the surrogate smooth)
-    _SLOW_PARAMS = ["p_Ring Mod Volume", "p_Cross Modulation"]
-    for _col in _SLOW_PARAMS:
-        if _col in result.best_df.columns:
-            result.best_df[_col] = smooth_trajectory(result.best_df[_col].values, 7)
+    if all_osc_configs:
+        # Run full CMA-ES for every osc config, render and save each, keep the best.
+        configs_to_try = list(_OSC_CONFIGS.keys())
+        print(f"\n=== CMA-ES refinement — all configs: {configs_to_try} "
+              f"(mode={mode}, popsize={popsize}, maxiter={maxiter}) ===")
+        all_results = {}
+        for cfg_name in configs_to_try:
+            print(f"\n--- Config: {cfg_name} ---")
+            cfg_result = cmaes_refine(**_shared_kwargs, force_osc_config=cfg_name)
+            cfg_result = _smooth_result(cfg_result)
+            cfg_all_cols = [c for c in cfg_result.best_df.columns if c.startswith("p_")]
+            cfg_audio, cfg_sr = _render_trajectory(
+                cfg_result.best_df, note_regions, cfg_all_cols,
+                profile_path, total_sec, _OSC_CONFIGS[cfg_name],
+            )
+            wav_name = f"rendered_{cfg_name.replace('+', '_plus_')}.wav"
+            sf.write(str(run_dir / wav_name), cfg_audio.T, cfg_sr)
+            print(f"  ✓ {cfg_name}: score={cfg_result.global_score:.4f}  → {wav_name}")
+            all_results[cfg_name] = cfg_result
+
+        best_cfg = min(all_results, key=lambda k: all_results[k].global_score)
+        result = all_results[best_cfg]
+        print(f"\n  ✓ Best config: '{best_cfg}' (score={result.global_score:.4f}) → rendered.wav")
+    else:
+        print(f"\n=== CMA-ES refinement (mode={mode}, popsize={popsize}, maxiter={maxiter}) ===")
+        result = cmaes_refine(**_shared_kwargs, force_osc_config=force_osc_config,
+                              on_improvement=_cmaes_checkpoint)
+        result = _smooth_result(result)
 
     # All param columns = surrogate 15 + extra 7 (now in result.best_df)
     all_param_cols = [c for c in result.best_df.columns if c.startswith("p_")]
@@ -1703,6 +1736,12 @@ if __name__ == "__main__":
                     help="global=fast bypass (single patch, ~0.029); "
                          "per-region=independent per note region; "
                          "hybrid=global first then conditional per-region (default)")
+    ap.add_argument("--cmaes-osc-config", default=None,
+                    choices=["saw", "pulse", "saw+pulse"],
+                    help="Force a specific osc config, skipping scouting (default: run scouting)")
+    ap.add_argument("--cmaes-all-configs", action="store_true",
+                    help="Run full CMA-ES for all 3 osc configs; render each as "
+                         "rendered_<config>.wav and save the best as rendered.wav")
     ap.add_argument("--cmaes-popsize", type=int, default=16)
     ap.add_argument("--cmaes-maxiter", type=int, default=20)
     ap.add_argument("--cmaes-sigma0", type=float, default=0.08,
@@ -1727,7 +1766,7 @@ if __name__ == "__main__":
         args.surrogate = str(runs[-1] / "state_dict.pt")
 
     if args.profile is None:
-        args.profile = str(Path(__file__).resolve().parent.parent / "s01_profiles" / "obxf.yaml")
+        args.profile = str(_defs.PROFILE_PATH)
 
     stream_invert(
         target_wav=Path(args.target),
@@ -1747,6 +1786,8 @@ if __name__ == "__main__":
         hill_offsets=hill_offsets,
         run_cmaes=args.cmaes,
         cmaes_mode=args.cmaes_mode,
+        cmaes_osc_config=args.cmaes_osc_config,
+        cmaes_all_configs=args.cmaes_all_configs,
         cmaes_popsize=args.cmaes_popsize,
         cmaes_maxiter=args.cmaes_maxiter,
         cmaes_sigma0=args.cmaes_sigma0,

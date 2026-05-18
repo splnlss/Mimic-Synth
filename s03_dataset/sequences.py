@@ -153,7 +153,8 @@ def build_sequence_dataset(
     n_frames = int(round(seconds * control_hz))
 
     engine = daw.RenderEngine(SAMPLE_RATE, BUFFER_SIZE)
-    synth = engine.make_plugin_processor("obxf", resolve_plugin_path(profile))
+    synth_id = profile.get("synth", {}).get("id", "synth")
+    synth = engine.make_plugin_processor(synth_id, resolve_plugin_path(profile))
     name_idx = build_name_index(synth)
     engine.load_graph([(synth, [])])
 

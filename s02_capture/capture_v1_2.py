@@ -1,5 +1,5 @@
 """
-Bucket 2 V1.2: OB-Xf capture rig.
+Bucket 2 V1.2: Capture rig.
 Renders (parameter vector, note) -> WAV via DawDreamer.
 Runs on macOS, Windows, Linux.
 
@@ -45,7 +45,7 @@ CHECKPOINT_EVERY = 50        # flush parquet every N vectors
 
 # Settle pass — renders silent chunks to drain release tails between captures.
 SETTLE_CHUNK_SEC = 0.05      # 50ms chunks (faster polling than v1.1's 100ms)
-SETTLE_MAX_SEC = 10.0        # long OB-Xf releases with high resonance can ring for 8s+
+SETTLE_MAX_SEC = 10.0        # long releases with high resonance can ring for 8s+
 SETTLE_THRESHOLD = 1e-4      # match the silence detector — no point settling below noise floor
 
 WAV_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,10 +66,8 @@ def resolve_plugin_path(profile):
     }[sys]
     path = Path(profile["synth"][key]).expanduser()
     if not path.exists():
-        raise FileNotFoundError(
-            f"OB-Xf not found at {path}. Install from "
-            "https://github.com/surge-synthesizer/OB-Xf/releases"
-        )
+        synth_name = profile.get("synth", {}).get("name", "VST plugin")
+        raise FileNotFoundError(f"{synth_name} not found at {path}.")
     return str(path)
 
 
@@ -263,14 +261,16 @@ def main():
     plugin_path = resolve_plugin_path(profile)
     import dawdreamer as daw  # noqa: PLC0415 — lazy import; pure helpers must not require DawDreamer
     engine = daw.RenderEngine(SAMPLE_RATE, BUFFER_SIZE)
-    synth = engine.make_plugin_processor("obxf", plugin_path)
+    synth_id = profile.get("synth", {}).get("id", "synth")
+    synth = engine.make_plugin_processor(synth_id, plugin_path)
     name_idx = build_name_index(synth)
 
     missing = [n for n in modulated if n not in name_idx]
     if missing:
+        synth_name = profile.get("synth", {}).get("name", "the loaded plugin")
         raise RuntimeError(
-            f"Profile references parameters not exposed by this OB-Xf build: {missing}. "
-            "Run enumerate_params.py and reconcile s01_profiles/obxf.yaml."
+            f"Profile references parameters not exposed by {synth_name}: {missing}. "
+            "Run enumerate_params.py and reconcile the profile."
         )
 
     rows, done_hashes = _load_existing_rows()

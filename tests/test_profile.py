@@ -1,11 +1,13 @@
 """
-Unit tests for s01_profiles/obxf.yaml — no DawDreamer required.
+Unit tests for the active synth profile — no DawDreamer required.
 """
+import sys
 from pathlib import Path
 import pytest
 import yaml
 
-PROFILE_PATH = Path(__file__).parent.parent / "s01_profiles" / "obxf.yaml"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from defaults import PROFILE_PATH
 
 
 @pytest.fixture(scope="module")

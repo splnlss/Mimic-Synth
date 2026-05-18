@@ -1,14 +1,18 @@
 """
-Integration tests — require DawDreamer + OB-Xf installed.
+Integration tests — require DawDreamer + VST plugin installed.
 Run with: pytest tests/test_integration.py -v -m integration
 
 These tests load the actual VST and render audio, so they take a few seconds.
 """
 import platform
+import sys
 from pathlib import Path
 import numpy as np
 import pytest
 import yaml
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from defaults import PROFILE_PATH
 
 from s02_capture.capture_v1_2 import (
     load_profile, resolve_plugin_path, build_name_index,
@@ -17,8 +21,6 @@ from s02_capture.capture_v1_2 import (
 )
 
 pytestmark = pytest.mark.integration
-
-PROFILE_PATH = Path(__file__).parent.parent / "s01_profiles" / "obxf.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -31,7 +33,8 @@ def engine_synth_idx(profile):
     import dawdreamer as daw
     plugin_path = resolve_plugin_path(profile)
     engine = daw.RenderEngine(SAMPLE_RATE, BUFFER_SIZE)
-    synth = engine.make_plugin_processor("obxf", plugin_path)
+    synth_id = profile.get("synth", {}).get("id", "synth")
+    synth = engine.make_plugin_processor(synth_id, plugin_path)
     name_idx = build_name_index(synth)
     engine.load_graph([(synth, [])])
     return engine, synth, name_idx
@@ -39,7 +42,7 @@ def engine_synth_idx(profile):
 
 def test_plugin_loads_and_has_parameters(engine_synth_idx):
     _, synth, name_idx = engine_synth_idx
-    assert len(name_idx) > 0, "OB-Xf should expose at least one parameter"
+    assert len(name_idx) > 0, "Plugin should expose at least one parameter"
 
 
 def test_profile_params_exist_in_plugin(profile, engine_synth_idx):
@@ -51,7 +54,7 @@ def test_profile_params_exist_in_plugin(profile, engine_synth_idx):
     missing = [n for n in modulated if n not in name_idx]
     assert not missing, (
         f"Profile params not found in plugin: {missing}. "
-        "Run enumerate_params.py and reconcile s01_profiles/obxf.yaml."
+        "Run enumerate_params.py and reconcile the profile."
     )
 
 
@@ -73,10 +76,9 @@ def test_render_correct_length(profile, engine_synth_idx):
 
 
 def test_render_spectral_consistency(profile, engine_synth_idx):
-    """OB-Xf waveforms are NOT bit-exact between renders — oscillator phase is
-    not reset between DawDreamer render calls ("Suppressing default patch" race
-    condition in v1.0.3). Timbral content (spectral centroid) must stay within
-    5% across renders, which is sufficient for surrogate training."""
+    """VST waveforms are NOT bit-exact between renders — oscillator phase is
+    not reset between DawDreamer render calls. Timbral content (spectral centroid)
+    must stay within 5% across renders, which is sufficient for surrogate training."""
     engine, synth, name_idx = engine_synth_idx
 
     def spectral_centroid(audio):

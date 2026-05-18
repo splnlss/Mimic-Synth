@@ -8,9 +8,10 @@ import numpy as np
 import pytest
 import yaml
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from defaults import PROFILE_PATH
 from s02_capture.capture_v1_2 import apply_params, sample_vectors, resolve_plugin_path, load_profile
-
-PROFILE_PATH = Path(__file__).parent.parent / "s01_profiles" / "obxf.yaml"
 
 
 @pytest.fixture(scope="module")
@@ -117,9 +118,9 @@ def test_resolve_plugin_path_real_macos():
 def test_resolve_plugin_path_missing_raises():
     fake_profile = {
         "synth": {
-            "plugin_path_macos":   "/nonexistent/OB-Xf.vst3",
-            "plugin_path_windows": "C:/nonexistent/OB-Xf.vst3",
-            "plugin_path_linux":   "/nonexistent/OB-Xf.vst3",
+            "plugin_path_macos":   "/nonexistent/Synth.vst3",
+            "plugin_path_windows": "C:/nonexistent/Synth.vst3",
+            "plugin_path_linux":   "/nonexistent/Synth.vst3",
         }
     }
     with pytest.raises(FileNotFoundError):

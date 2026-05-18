@@ -69,7 +69,8 @@ def main():
     try:
         engine = daw.RenderEngine(SR, BUFFER)
         print(f"Created engine, loading plugin...")
-        synth = engine.make_plugin_processor("obxf", str(vst3_dir))
+        synth_id = profile.get("synth", {}).get("id", "synth")
+        synth = engine.make_plugin_processor(synth_id, str(vst3_dir))
         print(f"Plugin loaded successfully")
         
         n = synth.get_plugin_parameter_size()

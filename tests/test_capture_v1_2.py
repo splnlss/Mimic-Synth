@@ -33,7 +33,10 @@ measure_self_noise = capture_v1_2.measure_self_noise
 settle = capture_v1_2.settle
 render_one = capture_v1_2.render_one
 
-PROFILE_PATH = Path(__file__).parent.parent / "s01_profiles" / "obxf.yaml"
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from defaults import PROFILE_PATH as _DEFAULT_PROFILE
+PROFILE_PATH = _DEFAULT_PROFILE
 
 
 @pytest.fixture(scope="module")
@@ -228,9 +231,9 @@ def test_render_one_no_settle_call():
 def test_resolve_plugin_path_missing_raises():
     fake_profile = {
         "synth": {
-            "plugin_path_macos":   "/nonexistent/OB-Xf.vst3",
-            "plugin_path_windows": "C:/nonexistent/OB-Xf.vst3",
-            "plugin_path_linux":   "/nonexistent/OB-Xf.vst3",
+            "plugin_path_macos":   "/nonexistent/Synth.vst3",
+            "plugin_path_windows": "C:/nonexistent/Synth.vst3",
+            "plugin_path_linux":   "/nonexistent/Synth.vst3",
         }
     }
     with pytest.raises(FileNotFoundError):

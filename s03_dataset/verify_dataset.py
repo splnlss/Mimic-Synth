@@ -8,8 +8,8 @@ Load samples.parquet + every WAV, run each through quality.analyse, and report:
 - parameter-coverage stats (mean, std, min, max per column)
 
 Usage:
-    python -m s03_dataset.verify_dataset --dataset data/ --profile s01_profiles/obxf.yaml
-    python -m s03_dataset.verify_dataset --dataset data/ --profile s01_profiles/obxf.yaml --fail-threshold 0.01
+    python -m s03_dataset.verify_dataset --dataset data/
+    python -m s03_dataset.verify_dataset --dataset data/ --fail-threshold 0.01
 """
 from __future__ import annotations
 import argparse

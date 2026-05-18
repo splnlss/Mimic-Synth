@@ -1,6 +1,6 @@
 """Enforce mono WAV for all target inputs.
 
-OB-Xf synthesis is mono/stereo at output but target matching works on mono
+VST synthesis is mono/stereo at output but target matching works on mono
 embeddings. Keeping all targets mono eliminates channel-layout ambiguity and
 ensures EnCodec receives a consistent input shape.
 

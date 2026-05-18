@@ -10,7 +10,7 @@ A pipeline for building audio datasets from synthesizers and training models tha
 | S02 | `s02_capture/` | ✅ Complete | Capture rig — renders (param vector, note) to WAV via DawDreamer |
 | S03 | `s03_dataset/` | ✅ Complete | Dataset builder — Sobol sampling, quality gates, manifest, verifier |
 | S04 | `s04_embed/` | ✅ Complete | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
-| S05 | `s05_surrogate/` | ✅ Complete | Forward model — MLP mapping (params, note) → EnCodec latent |
+| S05 | `s05_surrogate/` | ✅ Complete | Forward model — FiLM+ResBlocks MLP (default: hidden_dim=1024, use_film=True) mapping (params, note) → embedding |
 | S06 | `s06_invert/` | ✅ Complete | Patch search — grad descent + CMA-ES inversion of target audio |
 | **S06b** | `s06b_live/` | ✅ Working | **Inversion** — surrogate-driven: note segmentation, pyworld pitch tracking, MIDI pitch bend, PINNED_PARAMS, α-refinement. Fast (~30s). |
 | **S07** | `s07_refine/` | ✅ Working | **Refinement** — real-VST-driven: hill-climb + CMA-ES (global/per-region/hybrid) with expanded 22-param space and composite scoring. No surrogate. Best quality (~15 min). |
@@ -28,7 +28,7 @@ A pipeline for building audio datasets from synthesizers and training models tha
 | Env | Setup | Used for |
 |-----|-------|---------|
 | `.venv` (Python 3.14) | `python -m venv .venv && pip install -r requirements.txt` | Unit tests, CPU-only utilities |
-| `mimic-synth` conda (Python 3.11) | `conda env create -f environment.yml` | All pipeline stages (DawDreamer + torch/CUDA) |
+| `mimic-synth` conda (Python 3.11) | `conda env create -f environment.yml` | All pipeline stages (DawDreamer + torch/CUDA + laion-clap) |
 
 `torch` and `dawdreamer` are only in the conda env. Running pipeline commands with `.venv/bin/python` will fail.
 
@@ -123,10 +123,17 @@ python -m s03_dataset.verify_dataset
 
 ### 4. Embed the dataset (S04)
 
-Pre-computes 128-d EnCodec embeddings aligned 1-to-1 with `samples.parquet`. All paths default via `defaults.py`.
+Pre-computes audio embeddings aligned 1-to-1 with `samples.parquet`. Default: 128-d EnCodec mean-pooled. Optional: 512-d LAION-CLAP (`--embed-model clap`). All paths default via `defaults.py`.
 
 ```bash
+# EnCodec (default, 128-d, fast)
 python -m s04_embed.index_dataset --pool mean --batch-size 64
+
+# LAION-CLAP (512-d, per-sample — slower, no batching)
+python -m s04_embed.index_dataset --embed-model clap
+
+# Also compute MRSTFT spectral features (1924-d, for aux loss during S05 training)
+python -m s04_embed.index_dataset --pool mean --batch-size 64 --mrstft
 ```
 
 Checkpoints every 500 rows. Verify with:
@@ -137,11 +144,28 @@ python -m s04_embed.verify_embeddings
 
 ### 5. Train the surrogate (S05)
 
-Trains a 4-layer MLP to approximate `f(params, note) → EnCodec latent`. All paths default via `defaults.py`.
+Trains a FiLM+ResBlocks MLP to approximate `f(params, note) → embedding`. Default architecture: 3×`FiLMResBlock` with LayerNorm + per-layer note conditioning, `hidden_dim=1024`. Legacy 4-layer MLP available via `--no-film`. All paths default via `defaults.py`.
 
 ```bash
+# Default: FiLM arch, hidden_dim=1024, EnCodec targets, cosine LR
 python -m s05_surrogate.train
+
+# Larger model
+python -m s05_surrogate.train --hidden-dim 2048
+
+# Train on CLAP embeddings (requires clap_embeddings.npy from S04)
+python -m s05_surrogate.train --embed-model clap \
+    --embeddings /path/to/clap_embeddings.npy
+
+# With MRSTFT auxiliary spectral loss (requires mrstft_features.npy from S04)
+python -m s05_surrogate.train \
+    --mrstft-features /path/to/mrstft_features.npy
+
+# Legacy 4-layer MLP (old checkpoints, smaller model)
+python -m s05_surrogate.train --no-film --hidden-dim 512
 ```
+
+Key: `SurrogateMRSTFTHead` is training-only — it is **not** saved to `state_dict.pt` so the inference API is unchanged. The manifest records `hidden_dim`, `use_film`, `output_dim`, and `embed_model`; all `_load_surrogate` callers read these with `.get()` defaults so old checkpoints load without modification.
 
 Verify with a full round-trip check on the held-out test split (spec criterion: cos-sim ≥ 0.9):
 
@@ -285,13 +309,13 @@ s03_dataset/
   verify_dataset.py          # Post-hoc auditor
 
 s04_embed/
-  embed.py                   # Embedder class (EnCodec 48kHz)
-  index_dataset.py           # Pre-compute embeddings CLI
+  embed.py                   # Embedder class (EnCodec 48kHz + LAION-CLAP 512-d + MRSTFT feats)
+  index_dataset.py           # Pre-compute embeddings CLI (--embed-model encodec/clap, --mrstft)
   verify_embeddings.py       # Post-hoc embedding auditor
 
 s05_surrogate/
-  model.py                   # Surrogate MLP + SurrogateDataset
-  train.py                   # Training loop CLI
+  model.py                   # Surrogate (FiLM+ResBlocks or legacy MLP) + SurrogateMRSTFTHead + SurrogateDataset
+  train.py                   # Training loop CLI (--film/--no-film, --hidden-dim, --embed-model, --mrstft-features, cosine LR)
   verify_surrogate.py        # Round-trip + sweep + gradient checks
 
 s06_invert/
@@ -482,6 +506,7 @@ The current `target_analysis.py` answers 5 heuristic design questions. Grounding
 
 ### Better scoring
 
+- ~~**MRSTFT auxiliary loss during surrogate training**~~ **Done.** `SurrogateMRSTFTHead` predicts 1924-d spectral features (weighted 0.1×) during training; excluded from `state_dict.pt` so inference is unchanged. Requires `mrstft_features.npy` from S04 (`--mrstft`).
 - **Per-frame SP distance** — `SP_WEIGHT = 0.15` in `audio_compare.py`; composite is `0.40×EnCodec + 0.25×MRSTFT + 0.20×AP + 0.15×SP`. Directly rewards the optimizer for matching filter movement frame-by-frame.
 - **Pitch-invariant timbral scoring** — pitch-shift the render to match the source before embedding, so cosine distance measures timbre rather than penalizing small pitch errors.
 - **LUFS normalization** — `_lufs_normalize()` in `audio_compare.py`; applied before all scoring comparisons.
@@ -490,7 +515,7 @@ The current `target_analysis.py` answers 5 heuristic design questions. Grounding
 
 - **Hierarchical search** — separate coarse (discrete: oscillator type, Osc 2 interval, ring mod on/off) from medium (ADSR set analytically from target waveform) from fine (CMA-ES on the remaining 8–10 parameters). Shrinks the effective CMA-ES search space 3–5×.
 - **DDSP analysis as CMA-ES warm-start** — Google's DDSP extracts continuous filter cutoff and harmonic amplitude trajectories analytically. Using those as x0 instead of the current target_analysis heuristics would give dramatically better convergence.
-- **Surrogate retrained on production data** — after capture completes, rebuild S03 → S04 → S05. The surrogate's input dimension is read directly from the profile, so adding parameters to `obxf.yaml` automatically expands the model on the next train.
+- **Surrogate retrained on production data** — after capture completes, rebuild S03 → S04 → S05. The surrogate's input dimension is read directly from the profile, so adding parameters to `obxf.yaml` automatically expands the model on the next train. New arch (FiLM+ResBlocks, `hidden_dim=1024`) is the default since PR #1.
 
 ### Offline synth calibration
 

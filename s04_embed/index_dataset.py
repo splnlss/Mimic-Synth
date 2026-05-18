@@ -231,6 +231,7 @@ def index_dataset(
                     mrstft_done[idx] = True
         pbar.update(len(batch_indices))
         newly_done += len(batch_indices)
+        pbar.set_postfix(done=int(done_mask.sum()), skipped=skipped)
         batch_indices.clear()
         batch_audios.clear()
         if newly_done >= next_ckpt:
@@ -248,6 +249,7 @@ def index_dataset(
             skipped += 1
             done_mask[i] = True
             pbar.update(1)
+            pbar.set_postfix(done=int(done_mask.sum()), skipped=skipped)
             continue
 
         audio, file_sr = sf.read(wav_path, dtype="float32", always_2d=False)

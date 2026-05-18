@@ -8,6 +8,7 @@ import numpy as np
 import argparse
 import datetime
 from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 from .model import Surrogate, SurrogateDataset, SurrogateMRSTFTHead
 import defaults as _defs
 
@@ -97,13 +98,18 @@ def train():
     best_val_loss = float("inf")
     scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
 
-    for epoch in range(start_epoch, args.epochs):
+    epoch_bar = tqdm(range(start_epoch, args.epochs), desc="training",
+                     unit="epoch", initial=start_epoch, total=args.epochs)
+
+    for epoch in epoch_bar:
         model.train()
         if mrstft_head is not None:
             mrstft_head.train()
         train_loss = 0
 
-        for batch in train_loader:
+        batch_bar = tqdm(train_loader, desc=f"  epoch {epoch:3d} train",
+                         unit="batch", leave=False)
+        for batch in batch_bar:
             if mrstft is not None:
                 b_params, b_notes, b_latents, b_mrstft = batch
                 b_mrstft = b_mrstft.to(args.device)
@@ -133,6 +139,8 @@ def train():
             scaler.step(optimizer)
             scaler.update()
             train_loss += loss.item()
+            batch_bar.set_postfix(loss=f"{loss.item():.4f}")
+        batch_bar.close()
 
         # Validation (primary loss only — mrstft head is training-only)
         model.eval()
@@ -152,7 +160,6 @@ def train():
 
         avg_train = train_loss / len(train_loader)
         avg_val   = val_loss   / len(val_loader)
-        print(f"Epoch {epoch}: Train={avg_train:.6f}, Val={avg_val:.6f}")
 
         # Checkpoint (includes mrstft head state for resume)
         check_path = os.path.join(run_dir, "checkpoint_latest.pt")
@@ -169,11 +176,14 @@ def train():
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            # Save only the surrogate — mrstft head is not used at inference time
             torch.save(model.state_dict(), os.path.join(run_dir, "state_dict.pt"))
-            print(f"  → new best, saved state_dict.pt")
+            epoch_bar.write(f"  → epoch {epoch:3d}  train={avg_train:.4f}  val={avg_val:.4f}  ✓ new best")
 
+        epoch_bar.set_postfix(train=f"{avg_train:.4f}", val=f"{avg_val:.4f}",
+                              best=f"{best_val_loss:.4f}")
         scheduler.step()
+
+    epoch_bar.close()
 
     # Save manifest
     manifest = {

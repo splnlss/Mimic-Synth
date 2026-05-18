@@ -50,8 +50,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
-import numpy as np
 from s07_refine.audio_compare import render_and_score
 
 
@@ -104,7 +104,7 @@ def hill_climb(
     candidates = [c for c in param_cols if c not in pinned_cols]
 
     if not candidates:
-        # Should never happen with the OB-Xf profile, but be defensive.
+        # Should never happen with a valid profile, but be defensive.
         if verbose:
             print("  Hill climb: no unpinned params to optimise.")
         return df.copy(), float("inf"), []
@@ -130,11 +130,11 @@ def hill_climb(
     offsets = tuple(offsets)
 
     for pass_i in range(1, n_passes + 1):
-        if verbose:
-            print(f"\n  Pass {pass_i}/{n_passes}:")
         improved = False
+        pbar = tqdm(candidates, desc=f"  hill-climb pass {pass_i}/{n_passes}",
+                    unit="param", disable=not verbose)
 
-        for col in candidates:
+        for col in pbar:
             best_offset = 0.0
             best_score = current_score
             original = df[col].values.copy()
@@ -161,21 +161,24 @@ def hill_climb(
                     "score": best_score,
                     "delta": delta,
                 })
-                if verbose:
-                    p_name = col.removeprefix("p_")
-                    print(f"    {p_name:30s}  off={best_offset:+.2f}  "
-                          f"score={best_score:.4f}  Δ={delta:+.4f}")
+                p_name = col.removeprefix("p_")
+                pbar.write(f"    ✓ {p_name:30s}  off={best_offset:+.2f}  "
+                           f"score={best_score:.4f}  Δ={delta:+.4f}")
                 current_score = best_score
                 improved = True
 
+            pbar.set_postfix(score=f"{current_score:.4f}", moves=len(change_log))
+
+        pbar.close()
+
         if not improved:
             if verbose:
-                print(f"  No improvement in pass {pass_i} — stopping.")
+                print(f"  → No improvement in pass {pass_i} — stopping.")
             break
 
     if verbose:
         total_delta = current_score - initial_score
-        print(f"\n  Hill climb done: {initial_score:.4f} → {current_score:.4f}  "
+        print(f"  ✓ Hill climb done: {initial_score:.4f} → {current_score:.4f}  "
               f"(Δ {total_delta:+.4f}, {len(change_log)} moves)")
 
     return df, current_score, change_log

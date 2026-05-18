@@ -15,7 +15,7 @@ Usage:
         --surrogate s05_surrogate/runs/run_20260429_145056/state_dict.pt \\
         --dataset s03_dataset/data/samples.parquet \\
         --embeddings s04_embed/data/encodec_embeddings.npy \\
-        --profile s01_profiles/obxf.yaml
+        --profile path/to/profile.yaml
 """
 from __future__ import annotations
 

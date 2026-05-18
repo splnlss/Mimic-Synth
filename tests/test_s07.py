@@ -526,11 +526,11 @@ class TestSPScoring:
     def setup_method(self):
         from s07_refine.audio_compare import (
             compute_sp_features, _sp_dist,
-            ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT,
+            ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT, ENV_WEIGHT,
         )
         self.sp_feats = compute_sp_features
         self.sp_dist  = _sp_dist
-        self.weights  = (ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT)
+        self.weights  = (ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT, ENV_WEIGHT)
 
     def test_weights_sum_to_one(self):
         total = sum(self.weights)
@@ -702,9 +702,9 @@ class TestSmoke:
     def test_audio_compare_imports(self):
         from s07_refine.audio_compare import (
             _mrstft_dist, compute_ap_features, score_audio_composite,
-            ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT,
+            ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT, ENV_WEIGHT,
         )
-        assert abs(ENCODEC_WEIGHT + MRSTFT_WEIGHT + AP_WEIGHT + SP_WEIGHT - 1.0) < 1e-6
+        assert abs(ENCODEC_WEIGHT + MRSTFT_WEIGHT + AP_WEIGHT + SP_WEIGHT + ENV_WEIGHT - 1.0) < 1e-6
 
     def test_analyze_crane_scream_if_available(self):
         """Run full analysis on the actual target if it exists."""

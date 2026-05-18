@@ -11,10 +11,10 @@ Two modes:
 
 Usage:
     # Live capture
-    python -m s03_dataset.build_dataset --profile s01_profiles/obxf.yaml --m 10 --out data/
+    python -m s03_dataset.build_dataset --m 10 --out data/
 
     # Post-hoc from existing capture
-    python -m s03_dataset.build_dataset --profile s01_profiles/obxf.yaml --from-capture s02_capture/data/ --out s03_dataset/data/
+    python -m s03_dataset.build_dataset --from-capture s02_capture/data/ --out s03_dataset/data/
 """
 from __future__ import annotations
 import argparse
@@ -62,7 +62,8 @@ def build_dataset(
     notes = profile["probe"]["notes"]
 
     engine = daw.RenderEngine(SAMPLE_RATE, BUFFER_SIZE)
-    synth = engine.make_plugin_processor("obxf", resolve_plugin_path(profile))
+    synth_id = profile.get("synth", {}).get("id", "synth")
+    synth = engine.make_plugin_processor(synth_id, resolve_plugin_path(profile))
     name_idx = build_name_index(synth)
     engine.load_graph([(synth, [])])
 
@@ -174,7 +175,8 @@ def build_from_capture(
     counts = Counts()
     rows = []
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="quality gates"):
+    qbar = tqdm(df.iterrows(), total=len(df), desc="quality gates", unit="sample")
+    for _, row in qbar:
         counts.rendered += 1
         wav_path = Path(row["wav"])
         if not wav_path.is_absolute():
@@ -199,8 +201,12 @@ def build_from_capture(
         if stats.stuck:      counts.stuck += 1
         if stats.prev_bleed: counts.prev_bleed += 1
         if not stats.is_valid():
+            qbar.set_postfix(valid=counts.valid, silent=counts.silent,
+                             clipped=counts.clipped, stuck=counts.stuck)
             continue
         counts.valid += 1
+        qbar.set_postfix(valid=counts.valid, silent=counts.silent,
+                         clipped=counts.clipped, stuck=counts.stuck)
 
         h = str(row["hash"])
         note = int(row["note"])

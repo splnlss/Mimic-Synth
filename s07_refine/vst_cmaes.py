@@ -54,6 +54,7 @@ import pandas as pd
 import soundfile as sf
 import torch
 import yaml
+from tqdm import tqdm
 
 from s07_refine.audio_compare import (
     render_trajectory,
@@ -76,7 +77,7 @@ OSC_CONFIGS: dict[str, dict[str, float]] = {
 }
 
 # Discrete Osc 2 Pitch intervals (musical semitone offsets from unison).
-# Full OB-Xf range 0→1 = −24st to +24st; formula: param = 0.5 + st / 48.
+# Full range 0→1 = −24st to +24st; formula: param = 0.5 + st / 48.
 OSC2_INTERVALS: dict[str, float] = {
     "oct-dn":  round(0.5 + (-12) / 48.0, 6),   # 0.25000 — octave below
     "5th-dn":  round(0.5 + (-7)  / 48.0, 6),   # 0.35417 — fifth below
@@ -159,6 +160,8 @@ def cmaes_refine(
     device: str,
     # Mode
     mode: str = "hybrid",           # "global" | "per-region" | "hybrid"
+    # Osc config override (None = run scouting; "saw"/"pulse"/"saw+pulse" = skip scouting)
+    force_osc_config: str | None = None,
     # CMA-ES tuning
     sigma0: float = 0.10,
     popsize: int = 16,
@@ -197,6 +200,11 @@ def cmaes_refine(
 
     pinned_cols = set(pinned_cols)
 
+    # Amp Env Release was pinned during surrogate inversion (S06b) to prevent
+    # degenerate solutions. CMA-ES uses real renders and note-off compensation
+    # already tracks the actual param value, so we can let it vary in [0, 0.35].
+    pinned_cols.discard("p_Amp Env Release")
+
     # ── Extend to expanded param space ───────────────────────────────────────
     extra_param_meta = load_extra_params(profile_path)
     df, extra_cols = _extend_df(df, extra_param_meta)
@@ -209,6 +217,7 @@ def cmaes_refine(
         f"p_{name}": (cfg["lo"], cfg["hi"])
         for name, cfg in extra_param_meta.items()
     }
+    extra_bounds["p_Amp Env Release"] = (0.0, 0.35)
 
     # Dynamic Amp Env Attack bound: transient_min_ms * 0.5 gives the maximum
     # attack time the synth can have and still respond within each transient.
@@ -234,20 +243,27 @@ def cmaes_refine(
     full_target_mrstft = target_audio  # raw audio; auraloss computes MRSTFT in score_audio_composite
     full_target_ap = compute_ap_features(target_audio, int(sr_t))  # None if pyworld absent
     full_target_sp = compute_sp_features(target_audio, int(sr_t))  # None if pyworld absent
-
-    active = "EnCodec+MRSTFT" + ("+AP" if full_target_ap is not None else "")
+    active = "EnCodec+MRSTFT+Env" + ("+AP" if full_target_ap is not None else "")
     if verbose:
         print(f"  Scoring: {active} composite distance (renormalised weights)")
 
-    # ── Osc config scouting (once, regardless of mode) ───────────────────────
-    best_osc_config, scout_renders = _scout_osc_configs(
-        df=df, all_param_cols=all_param_cols, pinned_cols=pinned_cols,
-        note_regions=note_regions, profile_path=profile_path, total_sec=total_sec,
-        target_emb_t=full_target_emb_t, target_mrstft_audio=full_target_mrstft,
-        target_ap=full_target_ap, target_sp=full_target_sp,
-        embedder=embedder, device=device,
-        sigma0=sigma0 * 1.5, extra_bounds=extra_bounds, verbose=verbose, cma=cma,
-    )
+    # ── Osc config scouting (skip when force_osc_config is set) ─────────────
+    if force_osc_config is not None:
+        if force_osc_config not in OSC_CONFIGS:
+            raise ValueError(f"force_osc_config must be one of {list(OSC_CONFIGS)}, got {force_osc_config!r}")
+        best_osc_config = force_osc_config
+        scout_renders = 0
+        if verbose:
+            print(f"\n=== Osc config forced: {best_osc_config} (scouting skipped) ===")
+    else:
+        best_osc_config, scout_renders = _scout_osc_configs(
+            df=df, all_param_cols=all_param_cols, pinned_cols=pinned_cols,
+            note_regions=note_regions, profile_path=profile_path, total_sec=total_sec,
+            target_emb_t=full_target_emb_t, target_mrstft_audio=full_target_mrstft,
+            target_ap=full_target_ap, target_sp=full_target_sp,
+            embedder=embedder, device=device,
+            sigma0=sigma0 * 1.5, extra_bounds=extra_bounds, verbose=verbose, cma=cma,
+        )
     extra_osc = OSC_CONFIGS[best_osc_config]
     if verbose:
         print(f"\n  Selected oscillator config: {best_osc_config}")
@@ -415,12 +431,16 @@ def _run_per_region(
     total_restarts = 0
     all_logs: list[dict] = []
 
-    for reg_idx, region in enumerate(note_regions):
+    region_bar = tqdm(enumerate(note_regions), total=len(note_regions),
+                      desc="  per-region", unit="region", disable=not verbose)
+    for reg_idx, region in region_bar:
         reg_dur = max(0.05, region["offset_sec"] - region["onset_sec"])
         reg_note = region["midi_note"]
+        region_bar.set_postfix(region=reg_idx, midi=reg_note,
+                               best=f"{min(region_scores) if region_scores else float('inf'):.4f}")
         if verbose:
-            print(f"\n  Region {reg_idx}: {region['onset_sec']:.2f}–"
-                  f"{region['offset_sec']:.2f}s  MIDI={reg_note}  ({reg_dur:.2f}s)")
+            region_bar.write(f"\n  Region {reg_idx}: {region['onset_sec']:.2f}–"
+                             f"{region['offset_sec']:.2f}s  MIDI={reg_note}  ({reg_dur:.2f}s)")
 
         mask = ((df["timestamp"] >= region["onset_sec"]) &
                 (df["timestamp"] <= region["offset_sec"]))
@@ -451,8 +471,9 @@ def _run_per_region(
         region_best_params.append(best_params)
         region_scores.append(best_score)
         if verbose:
-            print(f"    Region {reg_idx} final: {best_score:.4f}")
+            region_bar.write(f"    Region {reg_idx} final: {best_score:.4f}")
 
+    region_bar.close()
     result_df = _stitch_with_crossfade(df, note_regions, region_best_params, all_param_cols, crossfade_sec, sr)
 
     audio, sr_r = render_trajectory(result_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
@@ -497,13 +518,16 @@ def _run_hybrid(
               f"(min_region={min_region_sec:.2f}s, "
               f"min_improvement={per_region_improvement*100:.0f}%)")
 
-    for reg_idx, region in enumerate(note_regions):
+    hybrid_bar = tqdm(enumerate(note_regions), total=len(note_regions),
+                      desc="  hybrid phase 2", unit="region", disable=not verbose)
+    for reg_idx, region in hybrid_bar:
         reg_dur = max(0.0, region["offset_sec"] - region["onset_sec"])
         reg_note = region["midi_note"]
+        hybrid_bar.set_postfix(region=reg_idx, midi=reg_note, score=f"{global_score:.4f}")
 
         if reg_dur < min_region_sec:
             if verbose:
-                print(f"  Region {reg_idx}: {reg_dur:.2f}s < {min_region_sec:.2f}s — skipped")
+                hybrid_bar.write(f"  Region {reg_idx}: {reg_dur:.2f}s < {min_region_sec:.2f}s — skipped")
             per_region_params.append(None)
             region_scores.append(float("nan"))
             continue
@@ -525,9 +549,9 @@ def _run_hybrid(
         n2 += 1
 
         if verbose:
-            print(f"\n  Region {reg_idx}: {region['onset_sec']:.2f}–"
-                  f"{region['offset_sec']:.2f}s  MIDI={reg_note}  "
-                  f"({reg_dur:.2f}s)  baseline={baseline_region_score:.4f}")
+            hybrid_bar.write(f"\n  Region {reg_idx}: {region['onset_sec']:.2f}–"
+                             f"{region['offset_sec']:.2f}s  MIDI={reg_note}  "
+                             f"({reg_dur:.2f}s)  baseline={baseline_region_score:.4f}")
 
         threshold = baseline_region_score * (1.0 - per_region_improvement)
         lo_r, hi_r = _make_bounds(free_cols, extra_bounds)
@@ -556,14 +580,14 @@ def _run_hybrid(
             per_region_params.append(best_params)
             region_scores.append(best_score)
             if verbose:
-                print(f"    ✓ Accepted: {baseline_region_score:.4f} → {best_score:.4f} "
-                      f"(improvement {(baseline_region_score - best_score)/baseline_region_score*100:.1f}%)")
+                hybrid_bar.write(f"    ✓ Accepted: {baseline_region_score:.4f} → {best_score:.4f} "
+                                 f"(improvement {(baseline_region_score - best_score)/baseline_region_score*100:.1f}%)")
         else:
             per_region_params.append(None)
             region_scores.append(baseline_region_score)
             if verbose:
-                print(f"    ✗ Rejected: {best_score:.4f} did not beat "
-                      f"threshold {threshold:.4f} — keeping global params")
+                hybrid_bar.write(f"    ✗ Rejected: {best_score:.4f} did not beat "
+                                 f"threshold {threshold:.4f} — keeping global params")
 
     has_any_override = any(p is not None for p in per_region_params)
     if has_any_override:
@@ -589,12 +613,14 @@ def _run_hybrid(
         final_score = score_audio_composite(audio, sr_r, target_emb_t, embedder, device, target_mrstft_audio, target_ap, target_sp)
         n2 += 1
         if verbose:
-            print(f"\n  Hybrid final global score: {final_score:.4f} "
-                  f"(vs global-only: {global_score:.4f})")
+            hybrid_bar.write(f"\n  → Hybrid final: {final_score:.4f} "
+                             f"(vs global-only: {global_score:.4f})")
         global_score = final_score
     else:
         if verbose:
-            print("\n  No per-region overrides accepted — global result unchanged.")
+            hybrid_bar.write("\n  → No per-region overrides accepted — global result unchanged.")
+
+    hybrid_bar.close()
 
     return result_df, region_scores, global_score, n1 + n2, restarts1 + restarts2, log1 + log2
 
@@ -672,6 +698,9 @@ def _run_cmaes_once(
     n_renders = 0
     log: list[dict] = []
 
+    pbar = tqdm(total=maxiter, desc=f"{verbose_prefix.strip() or 'cmaes'}",
+                unit="iter", leave=True, disable=not verbose)
+
     while not es.stop():
         xs = es.ask()
         scores = [float(objective(np.array(x))) for x in xs]
@@ -684,11 +713,13 @@ def _run_cmaes_once(
             best_x = np.array(xs[idx]).clip(0.0, 1.0)
 
         log.append({"iter": len(log), "best": float(best_score), "sigma": float(es.sigma)})
-        if verbose:
-            print(f"{verbose_prefix}iter {len(log):2d}  best={best_score:.4f}  σ={es.sigma:.4f}")
+        pbar.update(1)
+        pbar.set_postfix(best=f"{best_score:.4f}", sigma=f"{es.sigma:.4f}",
+                         renders=n_renders)
         if best_score <= score_target:
             break
 
+    pbar.close()
     return best_x, best_score, n_renders, log
 
 
@@ -808,7 +839,10 @@ def _scout_osc_configs(
     if verbose:
         print(f"\n=== Osc config scouting ===")
 
-    for config_name, osc_extra in OSC_CONFIGS.items():
+    scout_bar = tqdm(OSC_CONFIGS.items(), total=len(OSC_CONFIGS),
+                     desc="  osc configs", unit="config", disable=not verbose)
+    for config_name, osc_extra in scout_bar:
+        scout_bar.set_postfix(config=config_name, best=f"{best_score:.4f}")
         _, score, n, _ = _run_cmaes_once(
             objective=lambda x, _osc=osc_extra: _score_global(
                 x, free_cols, pinned_cols, x0_median, df, all_param_cols,
@@ -820,11 +854,12 @@ def _scout_osc_configs(
             score_target=0.02, verbose=False, verbose_prefix="", cma=cma,
         )
         total_renders += n
-        if verbose:
-            print(f"  {config_name:10s} → {score:.4f}  ({n} renders)")
+        scout_bar.write(f"  {config_name:10s} → {score:.4f}  ({n} renders)")
         if score < best_score:
             best_score = score
             best_config = config_name
+        scout_bar.set_postfix(config=config_name, best=f"{best_score:.4f}")
+    scout_bar.close()
 
     return best_config, total_renders
 
@@ -856,7 +891,10 @@ def _scout_osc2_intervals(
     if verbose:
         print(f"\n=== Osc 2 interval scouting ===")
 
-    for name, osc2_val in OSC2_INTERVALS.items():
+    int_bar = tqdm(OSC2_INTERVALS.items(), total=len(OSC2_INTERVALS),
+                   desc="  osc2 intervals", unit="interval", disable=not verbose)
+    for name, osc2_val in int_bar:
+        int_bar.set_postfix(interval=name, best=f"{best_score:.4f}")
         osc_extra = {**base_osc_extra, "Osc 2 Pitch": osc2_val}
         _, score, n, _ = _run_cmaes_once(
             objective=lambda x, _osc=osc_extra: _score_global(
@@ -869,12 +907,13 @@ def _scout_osc2_intervals(
             score_target=0.02, verbose=False, verbose_prefix="", cma=cma,
         )
         total_renders += n
-        if verbose:
-            print(f"  {name:8s} (param={osc2_val:.4f}) → {score:.4f}  ({n} renders)")
+        int_bar.write(f"  {name:8s} (param={osc2_val:.4f}) → {score:.4f}  ({n} renders)")
         if score < best_score:
             best_score = score
             best_name = name
             best_val = osc2_val
+        int_bar.set_postfix(interval=name, best=f"{best_score:.4f}")
+    int_bar.close()
 
     return best_name, best_val, total_renders
 
