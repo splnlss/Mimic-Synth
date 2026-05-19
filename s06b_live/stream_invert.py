@@ -817,8 +817,10 @@ def _write_settings_md(
     region_lines = []
     for i, r in enumerate(note_regions):
         dur = r["offset_sec"] - r["onset_sec"]
+        hz = r.get('median_hz')
+        hz_str = f"{hz:.0f} Hz" if hz is not None else "?"
         region_lines.append(
-            f"  {i+1}. MIDI {r['midi_note']} ({r.get('median_hz', 0):.0f} Hz)  "
+            f"  {i+1}. MIDI {r['midi_note']} ({hz_str})  "
             f"{r['onset_sec']:.3f}–{r['offset_sec']:.3f}s  ({dur*1000:.0f} ms)"
         )
 
