@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mimic-synth"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+mimic-capture            = "mimic_synth.s01_capture.capture_v1_2:main"
+mimic-build              = "mimic_synth.s02_dataset.build_dataset:main"
+mimic-embed              = "mimic_synth.s03_embed.index_dataset:main"
+mimic-train              = "mimic_synth.s04_surrogate.train:main"
+mimic-invert             = "mimic_synth.s05_invert.stream_invert:main"
+mimic-verify-dataset     = "mimic_synth.s02_dataset.verify_dataset:main"
+mimic-verify-embeddings  = "mimic_synth.s03_embed.verify_embeddings:main"
+mimic-verify-surrogate   = "mimic_synth.s04_surrogate.verify_surrogate:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+markers = ["integration: tests that require DawDreamer and VST plugin installed"]
+testpaths = ["tests"]
+
+[tool.setuptools.package-dir]
+"" = "src"

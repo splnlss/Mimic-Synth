@@ -13,18 +13,25 @@ Two-step migration to a `src` layout with consistent stage numbering across repo
 
 ## Stage mapping
 
+> **Note:** `s01_setup/` was added after this plan was originally written. It contains
+> `calibrate_synth.py`, `setup_project.py`, and `profiles/obxf-template.yaml`. These
+> move to `scripts/` and `docs/profiles/` respectively — there is no `s01_setup` package.
+
 | Old repo dir | New repo package | Old data dir | New data dir |
 |---|---|---|---|
-| `s01_profiles/` | _(moves to project as `profile.yaml`)_ | — | — |
+| `s01_setup/calibrate_synth.py` | `scripts/calibrate_synth.py` | — | — |
+| `s01_setup/setup_project.py` | `scripts/setup_project.py` | — | — |
+| `s01_setup/profiles/` | `docs/profiles/` | — | — |
 | `s02_capture/` | `src/mimic_synth/s01_capture/` | `s02_capture/` | `s01_capture/` |
 | `s03_dataset/` | `src/mimic_synth/s02_dataset/` | `s03_dataset/` | `s02_dataset/` |
 | `s04_embed/` | `src/mimic_synth/s03_embed/` | `s04_embed/` | `s03_embed/` (EnCodec + optional CLAP + optional MRSTFT) |
 | `s05_surrogate/` | `src/mimic_synth/s04_surrogate/` | `s05_surrogate/` | `s04_surrogate/` (FiLM+ResBlocks arch; `SurrogateMRSTFTHead` training-only) |
-| `s06_invert/` + `s06b_live/` | `src/mimic_synth/s05_invert/` | _(output only)_ | `outputs/` |
+| `s06_invert/` (offline/legacy) | `src/mimic_synth/s05_invert/stream_invert_offline.py`, `render_stream_legacy.py`, etc. | _(output only)_ | `outputs/` |
+| `s06b_live/stream_invert.py` (v4, **ACTIVE**) | `src/mimic_synth/s05_invert/stream_invert.py` | _(output only)_ | `outputs/` |
 | `s07_refine/` | `src/mimic_synth/s06_refine/` | _(output only)_ | `outputs/` |
 | `defaults.py` | `src/mimic_synth/config.py` | — | `project.yaml` |
 | `build_instructions/` | `docs/` | — | — |
-| `calibrate_synth.py` etc. | `scripts/` | — | — |
+| Root-level utility `.py` scripts | `scripts/` | — | — |
 | `targets/` | — | `targets/` | `inputs/` |
 
 ---
@@ -87,8 +94,11 @@ tests/
   unit/                      (move non-integration tests here)
   integration/               (move @pytest.mark.integration tests here)
 docs/                        (was build_instructions/)
-scripts/                     (root-level utility scripts)
-  calibrate_synth.py
+  profiles/
+    obxf-template.yaml       (was s01_setup/profiles/)
+scripts/                     (root-level utility scripts + was s01_setup/)
+  calibrate_synth.py         (was s01_setup/calibrate_synth.py)
+  setup_project.py           (was s01_setup/setup_project.py)
   enumerate_params.py
   analyze_audio.py
   check_audio.py
@@ -112,23 +122,27 @@ SECURITY.md
 ```
 
 **Remove from root after migration:**
-- `defaults.py`
-- `s01_profiles/`
-- `s02_capture/`
-- `s03_dataset/`
-- `s04_embed/`
-- `s05_surrogate/`
-- `s06_invert/`
-- `s06b_live/`
-- `s07_refine/`
-- `build_instructions/`
-- All root-level `*.py` utility scripts
-- Stale root-level logs: `s03_build_output.log`, `s03_rebuild.log`, `s03_run.log`, `s04_embed_resume.log`, `s05_surrogate/train.log`
-- `run_s02_s03_s04.sh`
+- `defaults.py` ✅ Done in Step 1
+- `s01_setup/` ✅ Done in Step 1 (was not in original plan — added after writing)
+- `s02_capture/` ✅ Done in Step 1
+- `s03_dataset/` ✅ Done in Step 1
+- `s04_embed/` ✅ Done in Step 1
+- `s05_surrogate/` ✅ Done in Step 1
+- `s06_invert/` ✅ Done in Step 1
+- `s06b_live/` ⚠️ Deferred — background process (PID 82639) still running; delete after it completes
+- `s06b_results/` ✅ Done in Step 1 (was data output dir, not code)
+- `s07_refine/` ✅ Done in Step 1
+- `build_instructions/` ✅ Done in Step 1
+- All root-level `*.py` utility scripts ✅ Done in Step 1
+- Stale root-level logs: `s03_build_output.log`, `s03_rebuild.log`, `s03_run.log`, `s04_embed_resume.log` ✅ Done in Step 1
+- `run_s02_s03_s04.sh` ✅ Done in Step 1
+- `pytest.ini` ✅ Done in Step 1 (superseded by `pyproject.toml`)
 
 ### 1.2 Write `src/mimic_synth/config.py`
 
 Identical API to current `defaults.py` — same exported names, same derived paths. Downstream code that does `import defaults as _defs` changes to `from mimic_synth import config as _defs`. No logic changes.
+
+> **Step 1 constraint:** `config.py` keeps the **current data folder stage numbers** (S02_DIR → `s02_capture/`, S03_DIR → `s03_dataset/`, etc.) so the running pipeline continues to work. The config.py in Step 1 is a drop-in replacement for `defaults.py`, not the future-numbered version shown below. The stage number renaming in `config.py` happens in Step 2 alongside the actual data folder renames.
 
 ```python
 # src/mimic_synth/config.py
@@ -531,20 +545,20 @@ mimic-invert --target /mnt/d/Mimic-Synth-Data/OB-X_Prototype/inputs/crane-scream
 
 ### Step 1 — Repo
 
-- [ ] `src/mimic_synth/` tree created
-- [ ] `config.py` written with env-var support
-- [ ] All stage packages moved and renamed
-- [ ] `s05_invert/` merged from `s06_invert/` + `s06b_live/`
-- [ ] All cross-stage absolute imports rewritten (see table in 1.3)
-- [ ] All test imports rewritten (see table in 1.3)
-- [ ] `pyproject.toml` written
-- [ ] `Makefile` written
-- [ ] `pip install -e .` succeeds in both envs
-- [ ] Unit tests pass: `.venv/bin/pytest tests/unit -m "not integration"`
-- [ ] Smoke-test imports pass
-- [ ] `docs/` populated from `build_instructions/`
-- [ ] `scripts/` populated from root-level utilities
-- [ ] Old top-level dirs removed
+- [x] `src/mimic_synth/` tree created
+- [x] `config.py` written with env-var support (mirrors `defaults.py` exactly — Step 2 renames stage numbers)
+- [x] All stage packages moved and renamed
+- [x] `s05_invert/` merged from `s06_invert/` + `s06b_live/` (`stream_invert.py` = v4 active; `stream_invert_offline.py` = legacy)
+- [x] All cross-stage absolute imports rewritten (see table in 1.3)
+- [x] All test imports rewritten (see table in 1.3)
+- [x] `pyproject.toml` written
+- [x] `Makefile` written
+- [x] `pip install -e .` succeeds in `.venv`
+- [x] Unit tests pass: `.venv/bin/pytest tests/unit -m "not integration"` — **200 passed, 13 skipped**
+- [ ] Smoke-test imports pass (conda env — run after conda `pip install -e .`)
+- [x] `docs/` populated from `build_instructions/`
+- [x] `scripts/` populated from root-level utilities + `s01_setup/`
+- [x] Old top-level dirs removed (except `s06b_live/` — background job PID 82639 still running)
 - [ ] `.gitignore` updated
 - [ ] `CLAUDE.md` and `README.md` updated with new commands
 
