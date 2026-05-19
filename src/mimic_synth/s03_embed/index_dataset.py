@@ -68,14 +68,27 @@ def _flush(npy_path: Path, done_path: Path, arr: np.ndarray, done: np.ndarray) -
 
 
 def _resolve_wav_root(dataset_dir: Path, df: pd.DataFrame) -> Path:
-    """Find the root directory for WAV paths in the parquet."""
-    wav_root = dataset_dir
-    if not df.empty:
-        sample_wav = df["wav"].iloc[0]
-        if not (dataset_dir / sample_wav).exists():
-            if (dataset_dir.parent / sample_wav).exists():
-                wav_root = dataset_dir.parent
-    return wav_root
+    """Find the root directory for relative WAV paths in the parquet.
+
+    Convention (new): paths stored relative to PROJECT_DIR — root is PROJECT_DIR.
+    Fallback heuristic for old absolute-path parquets: return empty Path so
+    the caller's is_absolute() check handles them without a prefix.
+    """
+    if df.empty:
+        return dataset_dir
+    sample_wav = df["wav"].iloc[0]
+    if Path(sample_wav).is_absolute():
+        return Path()           # absolute — no prefix needed
+    # New convention: relative to PROJECT_DIR
+    from mimic_synth.config import PROJECT_DIR
+    if (PROJECT_DIR / sample_wav).exists():
+        return PROJECT_DIR
+    # Legacy fallback: relative to parquet dir or its parent
+    if (dataset_dir / sample_wav).exists():
+        return dataset_dir
+    if (dataset_dir.parent / sample_wav).exists():
+        return dataset_dir.parent
+    return dataset_dir
 
 
 def _log_latent_stats(arr: np.ndarray, done: np.ndarray, dim: int) -> None:

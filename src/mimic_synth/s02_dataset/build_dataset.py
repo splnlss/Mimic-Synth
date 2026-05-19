@@ -113,7 +113,7 @@ def build_dataset(
             rows.append({
                 "hash": r["hash"],
                 "note": r["note"],
-                "wav": str(wav_path.relative_to(out_dir)),
+                "wav": str(wav_path.relative_to(_defs.PROJECT_DIR)),
                 "self_noise": r["self_noise"],
                 **{f"p_{k}": v for k, v in r["params_dict"].items()},
             })
@@ -210,7 +210,7 @@ def build_from_capture(
 
         h = str(row["hash"])
         note = int(row["note"])
-        row_dict = {"hash": h, "note": note, "wav": str(wav_path.resolve()), "self_noise": self_noise}
+        row_dict = {"hash": h, "note": note, "wav": str(wav_path.relative_to(_defs.PROJECT_DIR)), "self_noise": self_noise}
         for col in df.columns:
             if col.startswith("p_"):
                 row_dict[col] = float(row[col])

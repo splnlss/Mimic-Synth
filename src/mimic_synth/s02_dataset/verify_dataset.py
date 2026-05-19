@@ -72,14 +72,19 @@ def _check_param_columns(df: pd.DataFrame) -> dict[str, dict[str, float]]:
 
 
 def _resolve_wav_root(df: pd.DataFrame, parquet_dir: Path) -> Path:
-    """Return the directory that makes the first WAV path in the parquet resolvable.
+    """Return the root directory for resolving relative WAV paths in the parquet.
 
-    Tries parquet_dir first, then parquet_dir.parent — handles the case where
-    the parquet lives inside a subdirectory but paths were stored relative to
-    the parent (e.g. parquet at data/samples.parquet, paths as data/wav/...)."""
+    Convention (new): paths stored relative to PROJECT_DIR.
+    Legacy fallback: tries parquet_dir, then parquet_dir.parent.
+    """
     if df.empty:
         return parquet_dir
     sample = df["wav"].iloc[0]
+    if Path(sample).is_absolute():
+        return Path()           # absolute — no prefix needed
+    from mimic_synth.config import PROJECT_DIR
+    if (PROJECT_DIR / sample).exists():
+        return PROJECT_DIR
     if (parquet_dir / sample).exists():
         return parquet_dir
     if (parquet_dir.parent / sample).exists():

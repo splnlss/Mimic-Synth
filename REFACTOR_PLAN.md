@@ -389,7 +389,21 @@ print('All imports OK')
 
 **Goal:** Rename data stage directories to match the new numbering, rename `targets/` → `inputs/`, create `outputs/`, `reports/`, `logs/`, move profile and calibration file into the project, and introduce `project.yaml`.
 
-> ⚠️ **Critical dependency:** The `s02_dataset/samples.parquet` (old `s03_dataset`) stores **absolute paths** into `s01_capture/wav/` (old `s02_capture/wav/`). Renaming the capture directory invalidates those paths. The dataset must be rebuilt from the renamed capture directory after the rename (step 2.3).
+> **WAV path convention (updated in Step 1):** `samples.parquet` now stores WAV paths **relative to `PROJECT_DIR`** (e.g. `s02_capture/wav/abc123_n60.wav`), not as absolute paths. This was implemented in `capture_v1_2.py`, `build_dataset.py`, `verify_dataset.py`, and `index_dataset.py` as part of the Step 1 refactor. Readers use `_resolve_wav_root()` which tries `PROJECT_DIR` first, then falls back to parquet-dir and parquet-dir-parent for any legacy absolute-path parquets.
+>
+> **Impact on Step 2.3:** Because paths are relative to `PROJECT_DIR` rather than absolute, renaming `s02_capture/` → `s01_capture/` does invalidate the stored relative path prefix. However, no audio re-processing is needed — a one-line pandas migration is sufficient:
+>
+> ```python
+> import pandas as pd
+> from pathlib import Path
+>
+> parquet = Path("/mnt/d/Mimic-Synth-Data/OB-X_Prototype/s02_dataset/samples.parquet")
+> df = pd.read_parquet(parquet)
+> df["wav"] = df["wav"].str.replace("s02_capture/", "s01_capture/", n=1)
+> df.to_parquet(parquet)
+> ```
+>
+> Alternatively, run `mimic-build` to re-apply quality gates and regenerate the parquet from scratch (recommended if captures have been updated since the last build).
 
 ### 2.1 Rename stage directories
 
@@ -409,15 +423,17 @@ mv targets inputs
 mkdir -p outputs reports logs
 ```
 
-### 2.3 Rebuild s02_dataset (parquet paths are now stale)
+### 2.3 Update s02_dataset parquet (WAV path prefix changed)
 
-The parquet stored absolute paths to `s02_capture/wav/` — those paths no longer exist. Rebuild from the renamed capture:
+WAV paths stored as `s02_capture/wav/...` are now stale after renaming to `s01_capture`. Fix with the one-liner shown above, or do a full quality-gate rebuild:
 
 ```bash
 conda activate mimic-synth
 mimic-build   # reads S01_DIR from config.py, writes to S02_DIR
 mimic-verify-dataset
 ```
+
+The one-liner is sufficient if no new captures were added since the last build. Use `mimic-build` if you want to re-apply quality gates to any newly completed vectors from the M=14 production run.
 
 ### 2.4 Re-run s03_embed (embeddings are indexed against the old parquet)
 

@@ -1,528 +1,366 @@
 # MimicSynth
 
-A pipeline for building audio datasets from synthesizers and training models that learn the parameter-to-timbre mapping of a synth. Currently targets the [OB-Xf](https://github.com/surge-synthesizer/OB-Xf) (free, open-source OB-Xa emulation) via DawDreamer, with architecture designed to extend to hardware/analog synths via MIDI + audio interface.
+[![Python](https://img.shields.io/badge/python-3.11-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
+[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20WSL2-lightgrey)]()
 
-## Pipeline stages
+A Python pipeline that listens to a sound and finds the synthesizer knob settings that reproduce it. Give it a bird call, a crane scream, or any timbral target — it returns a `best_patch.yaml` you can load directly onto a compatible VST.
 
-| Stage | Folder | Status | Purpose |
-|-------|--------|--------|---------|
-| S01 | `s01_profiles/` | ✅ Complete | Synth profile — parameter definitions, importance weights, probe config |
-| S02 | `s02_capture/` | ✅ Complete | Capture rig — renders (param vector, note) to WAV via DawDreamer |
-| S03 | `s03_dataset/` | ✅ Complete | Dataset builder — Sobol sampling, quality gates, manifest, verifier |
-| S04 | `s04_embed/` | ✅ Complete | Audio embedding — EnCodec 48 kHz pre-quantiser latents (128-d) |
-| S05 | `s05_surrogate/` | ✅ Complete | Forward model — FiLM+ResBlocks MLP (default: hidden_dim=1024, use_film=True) mapping (params, note) → embedding |
-| S06 | `s06_invert/` | ✅ Complete | Patch search — grad descent + CMA-ES inversion of target audio |
-| **S06b** | `s06b_live/` | ✅ Working | **Inversion** — surrogate-driven: note segmentation, pyworld pitch tracking, MIDI pitch bend, PINNED_PARAMS, α-refinement. Fast (~30s). |
-| **S07** | `s07_refine/` | ✅ Working | **Refinement** — real-VST-driven: hill-climb + CMA-ES (global/per-region/hybrid) with expanded 22-param space and composite scoring. No surrogate. Best quality (~15 min). |
-| S08 | `s08_package/` | 🔲 Planned | Package — ONNX export for deployment |
+MimicSynth works by training a differentiable surrogate model of a synth's parameter-to-timbre mapping, then inverting that model with gradient descent and CMA-ES. The surrogate runs in milliseconds; the final refinement stage drives the real plugin for highest fidelity.
+
+![demo](docs/assets/demo.png)
 
 ---
 
-## Requirements
+## Table of Contents
 
-- [OB-Xf VST3](https://github.com/surge-synthesizer/OB-Xf/releases) installed at the system default path
-- Two Python environments (see below)
-
-### Environments
-
-| Env | Setup | Used for |
-|-----|-------|---------|
-| `.venv` (Python 3.14) | `python -m venv .venv && pip install -r requirements.txt` | Unit tests, CPU-only utilities |
-| `mimic-synth` conda (Python 3.11) | `conda env create -f environment.yml` | All pipeline stages (DawDreamer + torch/CUDA + laion-clap) |
-
-`torch` and `dawdreamer` are only in the conda env. Running pipeline commands with `.venv/bin/python` will fail.
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Quick Start](#quick-start)
+- [Pipeline](#pipeline)
+- [Usage — Inverting a Sound](#usage--inverting-a-sound)
+- [Project Structure](#project-structure)
+- [Extending to a New Synth](#extending-to-a-new-synth)
+- [Running Tests](#running-tests)
+- [Roadmap](#roadmap)
+- [License](#license)
 
 ---
 
-## Data storage
+## Features
 
-All pipeline outputs (WAVs, parquet, embeddings, model checkpoints, patches) live on an external drive — **not** in this repo. Source code stays here.
+- **Full inversion pipeline** — audio to synth patch in under 30 seconds (fast mode) or ~15 minutes (full CMA-ES quality)
+- **Synth-agnostic design** — a profile YAML describes any VST or hardware synth; only the profile changes between instruments
+- **Surrogate neural network** — FiLM+ResBlocks MLP with per-layer note conditioning; differentiable proxy that enables gradient-based search without rendering through the VST
+- **Real-VST refinement** — CMA-ES closes the surrogate-to-real gap by evaluating every candidate through the actual plugin
+- **Oscillator config and interval scouting** — discrete outer search over waveform types and Osc 2 pitch intervals before continuous CMA-ES
+- **Composite audio scoring** — EnCodec 33% + auraloss MRSTFT 22% + aperiodicity 17% + spectral envelope 13% + envelope shape 15%, all LUFS-normalised
+- **Automatic pitch tracking** — pyworld F0 at 5 ms resolution with autocorrelation fallback; writes MIDI pitch-bend output
+- **Checkpoint / resume** — every long-running stage checkpoints and resumes automatically on restart
+- **Best result so far: 0.029 cosine distance** on a crane-scream target (saw+pulse config, CMA-ES global mode)
 
-Each project folder contains a `PROJECT_STATUS.md` that tracks stage completion, quality results, the active surrogate checkpoint, and next steps. That file is the source of truth for project state; this README describes the software only.
+---
 
-Data root is configured in `defaults.py`:
+## Tech Stack
 
-```python
-DATA_ROOT    = Path("/mnt/d/Mimic-Synth-Data")   # D:\Mimic-Synth-Data on Windows
-PROJECT_NAME = "OB-X_Prototype"
+| Library | Purpose |
+|---|---|
+| [DawDreamer](https://github.com/DBraun/DawDreamer) | Headless VST host — renders audio from plugin + MIDI + automation |
+| [EnCodec](https://github.com/facebookresearch/encodec) | 128-d audio embeddings (48 kHz pre-quantiser latents) as perceptual distance metric |
+| [LAION-CLAP](https://github.com/LAION-AI/CLAP) | Optional 512-d audio embeddings for surrogate training (`--embed-model clap`) |
+| [auraloss](https://github.com/csteinmetz1/auraloss) | Multi-resolution STFT loss — composite scoring and auxiliary surrogate training loss |
+| [pyworld](https://github.com/JeremyCCHsu/Python-WORLD) | F0 / aperiodicity / spectral-envelope analysis (WORLD vocoder) |
+| [cma](https://github.com/CMA-ES/pycma) | CMA-ES optimiser for real-VST parameter search |
+| [pyloudnorm](https://github.com/csteinmetz1/pyloudnorm) | LUFS normalisation before all scoring comparisons |
+| [torchcrepe](https://github.com/maxrmorrison/torchcrepe) | Neural pitch detection (fallback / cross-check) |
+| PyTorch | Surrogate MLP training and gradient-based inversion |
+| pandas / pyarrow | Parquet storage for captured samples and per-frame parameters |
+| scipy (Sobol) | Quasi-random parameter sampling for dataset generation |
+
+Python 3.11 (conda env for pipeline), 3.14 (venv for tests). Platform: Linux / WSL2. GPU: CUDA recommended (RTX 3070+) for embedding and surrogate training.
+
+---
+
+## Installation
+
+### Prerequisites
+
+- Conda (Miniconda or Anaconda)
+- A supported VST3 synthesizer installed at the system default path (e.g. `~/.vst3/`)
+- CUDA-capable GPU recommended for embedding and training (CPU works but is slow)
+- ~50 GB disk space for a full production capture (M=14, 16 notes)
+
+### Clone and install
+
+```bash
+git clone https://github.com/splnlss/mimic-synth
+cd mimic-synth
+
+# Pipeline env (DawDreamer + PyTorch + CUDA)
+conda env create -f environment.yml
+conda activate mimic-synth
+pip install -e .
+
+# Test env (CPU-only, no DawDreamer or GPU needed)
+python -m venv .venv
+.venv/bin/pip install -e ".[dev]"
 ```
 
-Directory layout under `DATA_ROOT / PROJECT_NAME`:
+---
+
+## Configuration
+
+All data paths are resolved from two environment variables:
+
+```bash
+export MIMIC_DATA_ROOT=/mnt/d/Mimic-Synth-Data   # default
+export MIMIC_PROJECT=OB-X_Prototype               # default project name
+```
+
+The project folder at `$MIMIC_DATA_ROOT/$MIMIC_PROJECT/` must contain a `profile.yaml` describing the synth. All stage outputs are written under this folder. See [docs/01-profile.md](docs/01-profile.md) for the profile format.
+
+Project data folder layout:
 
 ```
 OB-X_Prototype/
-  s02_capture/          raw WAVs + samples.parquet
-  s03_dataset/          quality-gated dataset + manifest.yaml
-  s04_embed/            encodec_embeddings.npy
-  s05_surrogate/runs/   model checkpoints (state_dict.pt, surrogate.onnx)
-  s06_invert/patches/   inversion results (best_patch.yaml, rendered.wav, …)
-  targets/              target audio files used as inversion inputs
+  profile.yaml        Synth profile (parameters, probe config, behavior notes)
+  PROJECT_STATUS.md   Source of truth for stage completion and quality results
+  s01_capture/        Raw WAVs + samples.parquet
+  s02_dataset/        Quality-gated dataset + manifest.yaml
+  s03_embed/          encodec_embeddings.npy (+ optional clap, mrstft)
+  s04_surrogate/      Model runs/ + calibration.npz
+  inputs/             Target audio files for inversion
+  outputs/            Inversion results per target (best_patch.yaml, rendered.wav, …)
+  reports/            Verification reports
+  logs/               Pipeline logs
 ```
-
-Change `DATA_ROOT` and `PROJECT_NAME` in `defaults.py` to relocate or switch between projects.
 
 ---
 
-## Quickstart
-
-All pipeline commands require the conda env:
+## Quick Start
 
 ```bash
-conda activate mimic-synth
+# 1. Capture a small dev dataset (~30 min for M=10, 16 notes)
+conda activate mimic-synth && mimic-capture --m 10
+
+# 2. Build, embed, and train the surrogate (~1 hour on GPU)
+mimic-build && mimic-embed && mimic-train
+
+# 3. Invert a target sound (fast mode, ~30s)
+mimic-invert --target inputs/my-sound.wav --hill-iterations 0
+
+# 4. Find the output
+ls outputs/my-sound/
+# best_patch.yaml  rendered.wav  trajectory.yaml  settings.md
 ```
 
-### 1. Verify the plugin loads
+---
 
-```bash
-python enumerate_params.py
-```
+## Pipeline
 
-Lists all parameters exposed by the OB-Xf VST.
-
-### 2. Capture raw audio (S02)
-
-Renders 2^M Sobol-sampled parameter vectors × N notes into the data directory (N and M are defined in the profile). All output paths come from `defaults.py` — no flags needed.
-
-> **Important:** always run capture via `conda activate` + direct python, not `conda run`. `conda run` buffers stdout and the tqdm progress bar won't appear.
-
-```bash
-conda activate mimic-synth
-python s02_capture/capture_v1_2.py
-```
-
-Checkpoints every 50 vectors. If interrupted, re-run — it resumes automatically (interactive: choose **[c]ontinue**; non-interactive/background: resumes without prompting).
-
-> **Fresh start:** if the profile changes (new parameters or notes), the old parquet must be deleted before restarting or old rows with NaN param values will contaminate the dataset. Delete `s02_capture/samples.parquet` and `s02_capture/wav/` before re-running.
-
-Key features (v1.2):
-- **Settle-before-patch-change**: drains the old patch's release tail before loading new parameters
-- **Per-note settle**: drains between notes within the same parameter vector
-- **Adaptive settle threshold**: uses measured self-noise floor so self-oscillating patches don't stall
-- **Self-noise baseline**: 200ms silent render after each patch load, stored as `self_noise` in parquet
-- **Hard reset fallback**: reloads the graph when the settle loop times out
-
-### 3. Build the dataset (S03)
-
-Post-hoc mode reads an existing capture, applies quality gates, and writes a manifest. No re-rendering needed and no WAV copying — the output parquet stores absolute paths back into `s02_capture`. All paths default via `defaults.py`.
-
-```bash
-python -m s03_dataset.build_dataset
-```
-
-Or live capture from scratch (slower, requires DawDreamer):
-
-```bash
-python -m s03_dataset.build_dataset --m 14
-```
-
-Verify the result:
-
-```bash
-python -m s03_dataset.verify_dataset
-```
-
-### 4. Embed the dataset (S04)
-
-Pre-computes audio embeddings aligned 1-to-1 with `samples.parquet`. Default: 128-d EnCodec mean-pooled. Optional: 512-d LAION-CLAP (`--embed-model clap`). All paths default via `defaults.py`.
-
-```bash
-# EnCodec (default, 128-d, fast)
-python -m s04_embed.index_dataset --pool mean --batch-size 64
-
-# LAION-CLAP (512-d, per-sample — slower, no batching)
-python -m s04_embed.index_dataset --embed-model clap
-
-# Also compute MRSTFT spectral features (1924-d, for aux loss during S05 training)
-python -m s04_embed.index_dataset --pool mean --batch-size 64 --mrstft
-```
-
-Checkpoints every 500 rows. Verify with:
-
-```bash
-python -m s04_embed.verify_embeddings
-```
-
-### 5. Train the surrogate (S05)
-
-Trains a FiLM+ResBlocks MLP to approximate `f(params, note) → embedding`. Default architecture: 3×`FiLMResBlock` with LayerNorm + per-layer note conditioning, `hidden_dim=1024`. Legacy 4-layer MLP available via `--no-film`. All paths default via `defaults.py`.
-
-```bash
-# Default: FiLM arch, hidden_dim=1024, EnCodec targets, cosine LR
-python -m s05_surrogate.train
-
-# Larger model
-python -m s05_surrogate.train --hidden-dim 2048
-
-# Train on CLAP embeddings (requires clap_embeddings.npy from S04)
-python -m s05_surrogate.train --embed-model clap \
-    --embeddings /path/to/clap_embeddings.npy
-
-# With MRSTFT auxiliary spectral loss (requires mrstft_features.npy from S04)
-python -m s05_surrogate.train \
-    --mrstft-features /path/to/mrstft_features.npy
-
-# Legacy 4-layer MLP (old checkpoints, smaller model)
-python -m s05_surrogate.train --no-film --hidden-dim 512
-```
-
-Key: `SurrogateMRSTFTHead` is training-only — it is **not** saved to `state_dict.pt` so the inference API is unchanged. The manifest records `hidden_dim`, `use_film`, `output_dim`, and `embed_model`; all `_load_surrogate` callers read these with `.get()` defaults so old checkpoints load without modification.
-
-Verify with a full round-trip check on the held-out test split (spec criterion: cos-sim ≥ 0.9):
-
-```bash
-python -m s05_surrogate.verify_surrogate
-```
-
-Auto-selects the latest run in `S05_RUNS_DIR`. See the project's `PROJECT_STATUS.md` for the current checkpoint and quality metrics.
-
-### 6. Invert a target sound (S06) ⚠️ WIP
-
-Given a target WAV, finds the OB-Xf parameter vector whose surrogate-predicted embedding is closest to the target. Uses pitch detection to select the best MIDI note, then runs multi-start gradient descent followed by CMA-ES refinement.
-
-Profile, output directory, and surrogate checkpoint all default via `defaults.py`:
-
-```bash
-python -m s06_invert.invert --target path/to/target.wav
-```
-
-Output: `s06_invert/patches/<target_stem>/best_patch.yaml`, `candidates.parquet`, `target_embedding.npy`.
-
-### 6b + 7. Inversion (S06b) and Refinement (S07)
-
-S06b and S07 are two distinct stages that run in sequence. Understanding the difference helps you pick the right mode:
-
-| | S06b (Inversion) | S07 (Refinement) |
-|---|---|---|
-| **Driven by** | Surrogate neural network | Real OB-Xf renders |
-| **Speed** | ~30 seconds | 5–15 minutes |
-| **Output quality** | cosine dist ~0.10 | cosine dist ~0.03–0.09 |
-| **Use when** | Iterating, previewing | Final render |
-
-**S06b** uses gradient descent through the frozen surrogate — fast because it avoids the VST entirely during search. Pitch is tracked using pyworld F0 (5ms resolution, full-audio, deterministic) with an autocorrelation fallback. Fine pitch glides are written as MIDI pitch bend automation (affecting all oscillators simultaneously), not Osc 1 Pitch VST automation. S06b also runs an α-refinement loop that scales the surrogate's suggested direction by testing a handful of real renders, dropping from ~0.21 to ~0.10.
-
-**S07** abandons the surrogate and evaluates every candidate by rendering through the VST. S07 Strategy 1 (hill-climb) does per-param coordinate descent. S07 Strategy 2 (CMA-ES) scouts oscillator waveform configurations **and Osc 2 Pitch intervals** (7 discrete musical intervals: octave down through octave up), then runs a population-based search across the full surrogate param space plus any extra params defined in `cmaes_extra_params`, scoring each candidate with a composite distance: **EnCodec 40% + auraloss MRSTFT 25% + aperiodicity 20% + spectral envelope 15%**, all LUFS-normalised to −23 LUFS. Attack transient detection (librosa onset) sets a per-target dynamic upper bound on attack time.
-
-Per-frame **Filter Cutoff** is driven by a measured calibration curve (OB-Xf sweep: 420 Hz at cutoff=0 → 4134 Hz at cutoff=1), replacing the previous heuristic Nyquist-normalised formula. Ring Mod and Cross Modulation are smoothed with a 350ms window (7 frames) after CMA-ES to prevent high-frequency aliasing at region boundaries. The CMA-ES checkpoint writes `rendered.wav` at each IPOP restart improvement so progress is audible during the search.
-
-CMA-ES operates in three modes:
-- **`global`** (fastest): single CMA-ES pass applying global per-param offsets. Achieved **0.029** on crane scream.
-- **`per-region`** (experimental): independent CMA-ES per note region, each scored against that region's own target embedding. Prone to discontinuities on short regions.
-- **`hybrid`** (default): global first, then per-region fine-tune where it beats the global result by >5%. Linear crossfade at region boundaries.
-
-**All targets are automatically converted to mono** — if you pass a stereo file, the pipeline saves `<stem>_mono.wav` alongside it and uses that. For 3+ channels you will be prompted for instructions.
-
-**Each run writes to a timestamped subfolder**: `patches/<target_stem>/YYYYMMDD_HHMMSS/`
-
-#### Mode 1 — Fast (~30s): surrogate inversion + α-refinement only
-
-```bash
-conda run -n mimic-synth python -m s06b_live.stream_invert \
-    --target path/to/target.wav --hill-iterations 0
-```
-
-Good for iteration and checking pitch/timing before committing to a long run.
-
-#### Mode 2 — Standard (~5 min): + hill-climb (S07 Strategy 1)
-
-```bash
-# Default — hill-climb is on (--hill-iterations 2)
-conda run -n mimic-synth python -m s06b_live.stream_invert \
-    --target path/to/target.wav
-```
-
-For each unpinned parameter, tries offsets ±0.05 and ±0.15 globally across all frames; keeps the offset that lowers the composite scoring distance. Saves `hill_climb_log.yaml` showing which params moved and by how much.
-
-#### Mode 3 — Full quality (~15 min): + CMA-ES (S07 Strategy 2)
-
-```bash
-conda run -n mimic-synth python -m s06b_live.stream_invert \
-    --target path/to/target.wav --cmaes
-```
-
-Runs target analysis (spectral centroid, ADSR estimation, harmonic ratio, LFO detection) to warm-start the CMA-ES. Scouts 3 oscillator configs, then runs the selected config in hybrid mode (global + per-region fine-tune). IPOP restart with 1.5× population if stagnating. Achieved **0.029 cosine distance** on the crane scream (saw+pulse config, vs 0.21 surrogate-only).
-
-CMA-ES tuning flags:
-
-| Flag | Default | Purpose | Trade-off |
+| Stage | Package | CLI | Purpose |
 |---|---|---|---|
-| `--cmaes-mode` | `hybrid` | `global` (fastest, best score), `per-region` (experimental), `hybrid` (global then per-region fine-tune) | `global` achieved 0.029; `hybrid` is safer for complex multi-region targets |
-| `--cmaes-sigma0` | 0.08 | Search radius around x0 | 0.05 = refine near warm-start; 0.12 = explore widely; too large wastes budget on bad regions |
-| `--cmaes-popsize` | 16 | Candidates evaluated per iteration | Larger = better coverage but proportionally more renders; 24 gives ~50% more renders per iteration |
-| `--cmaes-maxiter` | 20 | Max CMA-ES iterations before IPOP restart | 30 recommended when combined with interval scouting; adds ~5 min but aids convergence |
+| S01 | — | — | Synth profile (`profile.yaml` in project folder) |
+| S02 | `mimic_synth.s01_capture` | `mimic-capture` | Render (params × notes) to WAV via DawDreamer |
+| S03 | `mimic_synth.s02_dataset` | `mimic-build` | Quality-gate captures, write dataset + manifest |
+| S04 | `mimic_synth.s03_embed` | `mimic-embed` | Pre-compute 128-d EnCodec embeddings |
+| S05 | `mimic_synth.s04_surrogate` | `mimic-train` | Train surrogate MLP f(params, note) → embedding |
+| S06 | `mimic_synth.s05_invert` | `mimic-invert` | Invert target audio (surrogate + α-refinement) |
+| S07 | `mimic_synth.s06_refine` | `mimic-refine` | Real-VST refinement: hill-climb + CMA-ES |
 
-**Recommended quality ladder** (crane scream baseline):
+### Running the full pipeline
 
-| Command | Time | Score |
+```bash
+conda activate mimic-synth
+make capture          # S01 capture (days for production M=14; M=10 for dev)
+make build            # S02 dataset
+make embed            # S03 embeddings
+make train            # S05 surrogate
+make verify-dataset
+make verify-embeddings
+make verify-surrogate
+```
+
+Data flow:
+
+```
+profile.yaml → sampling (Sobol) → capture (DawDreamer WAVs) → quality gates
+                                                                     ↓
+                                                         samples.parquet + WAVs
+                                                                     ↓
+                                                          EnCodec embedding → .npy
+                                                                     ↓
+                                               surrogate MLP training (params, note → latent)
+                                                                     ↓
+                                      target.wav → gradient inversion → CMA-ES refinement
+                                                                     ↓
+                                                         best_patch.yaml + rendered.wav
+```
+
+---
+
+## Usage — Inverting a Sound
+
+MimicSynth offers three quality modes. All write output to `outputs/<target-stem>/<timestamp>/`.
+
+```bash
+# Fast (~30s): surrogate inversion + α-refinement only
+# Good for iteration and preview
+mimic-invert --target inputs/my-sound.wav --hill-iterations 0
+
+# Standard (~5 min): + hill-climb (per-param coordinate descent on real VST)
+# Good for daily use on most targets
+mimic-invert --target inputs/my-sound.wav
+
+# Full quality (~15 min): + CMA-ES (osc config + interval scouting, IPOP restart)
+# Best for final-quality renders
+mimic-invert --target inputs/my-sound.wav --cmaes
+
+# Full quality, more iterations (~20 min)
+mimic-invert --target inputs/my-sound.wav --cmaes --cmaes-maxiter 30
+
+# Maximum quality (~30 min)
+mimic-invert --target inputs/my-sound.wav --cmaes \
+    --cmaes-sigma0 0.12 --cmaes-popsize 24 --cmaes-maxiter 30
+```
+
+### Quality ladder (crane-scream target)
+
+| Mode | Real-synth cosine distance | Time |
 |---|---|---|
-| `--hill-iterations 0` | ~30s | ~0.17 |
-| *(default)* | ~5 min | ~0.15 |
-| `--cmaes` | ~15 min | ~0.09–0.13 |
-| `--cmaes --cmaes-maxiter 30` | ~20 min | ~0.05–0.09 |
-| `--cmaes --cmaes-popsize 24 --cmaes-maxiter 30` | ~30 min | best quality |
+| Surrogate only | ~0.21 | ~30s |
+| + α-refinement | ~0.10 | ~30s |
+| + Hill-climb | ~0.094 | ~5 min |
+| + CMA-ES | **~0.029–0.042** | ~15 min |
 
-Output files per run: `stream_params.parquet`, `pitch_trajectory.yaml`, `fine_pitch_trajectory.yaml`, `pitch_bend.mid`, `best_patch.yaml`, `rendered.wav`, `rendered_normalized.wav`, `hill_climb_log.yaml` (if hill-climb ran), `cmaes_log.yaml` (if CMA-ES ran).
+Stereo targets are automatically converted to mono (L+R average).
 
-Key design constraints (all required for correct audio):
-
-- **`PINNED_PARAMS`** — `Osc 1 Pitch=0.5` (no transpose; pitch comes from MIDI note), `Amp Env Release=0.2` (prevents notes ringing through), `LFO 1 to Osc 1 Pitch=0.0` (no pitch wobble). Without these the surrogate AND the real-synth search both find degenerate solutions.
-- **`surrogate_note`** — detected MIDI note snapped to nearest profile training note for the surrogate context; exact MIDI note used for DawDreamer render. Keeps the surrogate in-distribution.
-- **Pitch bend via MIDI file** — fine pitch tracking (pyworld + autocorr fallback at 10ms) is written as a `.mid` file with calibrated ±6st bend range. This moves all oscillators together, unlike Osc 1 Pitch VST automation.
-- **Reset values applied before every render** — `audio_compare.py` applies all profile reset values first so OB-Xf starts from a known state regardless of previous plugin state.
+For a detailed walkthrough of the inversion and refinement algorithms, see [docs/algorithm.md](docs/algorithm.md).
 
 ---
 
-## Run tests
+## Project Structure
 
-Non-integration tests run under `.venv` (no DawDreamer or GPU needed):
+### Repository
+
+```
+mimic-synth/
+  src/mimic_synth/
+    config.py             Project path resolver (reads MIMIC_PROJECT env var)
+    s01_capture/          Capture rig — DawDreamer + Sobol sampling
+    s02_dataset/          Quality gates, manifest, dataset builder
+    s03_embed/            EnCodec embedding (128-d mean-pooled)
+    s04_surrogate/        Surrogate MLP — train, verify
+    s05_invert/           Inversion — grad search, stream invert, α-refinement
+    s06_refine/           Real-VST refinement — hill-climb, CMA-ES
+  tests/
+    unit/                 Fast tests (no DawDreamer or GPU)
+    integration/          Tests that require DawDreamer + VST installed
+  docs/                   Algorithm docs, per-stage design notes, profiles
+    profiles/             Synth profile templates
+  scripts/                One-off utilities (calibrate_synth.py, enumerate_params.py…)
+  Makefile
+  pyproject.toml
+  README.md
+  CLAUDE.md
+  LICENSE
+```
+
+### Project data folder (outside repo)
+
+```
+OB-X_Prototype/
+  project.yaml            Project config (synth name, Sobol M, stage paths)
+  profile.yaml            Synth profile (parameters, probe notes, behavior)
+  PROJECT_STATUS.md       Stage completion + quality metrics
+  s01_capture/            Raw WAVs + samples.parquet (~50 GB for M=14)
+  s02_dataset/            Quality-gated dataset + manifest.yaml
+  s03_embed/              encodec_embeddings.npy (+ optional clap, mrstft)
+  s04_surrogate/
+    runs/                 Model checkpoints (state_dict.pt, surrogate.onnx)
+    calibration.npz       Measured filter cutoff / envelope curves
+  inputs/                 Target audio files for inversion
+  outputs/                Per-target inversion results
+    my-sound/
+      20260518_143022/
+        best_patch.yaml
+        rendered.wav
+        trajectory.yaml
+        cmaes_log.yaml
+        settings.md
+  reports/                Verification CSV reports
+  logs/                   Pipeline run logs
+```
+
+---
+
+## Extending to a New Synth
+
+MimicSynth is designed to work with any VST or hardware synthesizer. Only the profile changes between instruments:
+
+1. Copy `docs/profiles/template.yaml` to your project folder as `profile.yaml`
+2. Define parameters, value ranges, importance weights, and probe notes for your synth
+3. Set `MIMIC_PROJECT` to a new project folder (or `MIMIC_DATA_ROOT` if on a different drive)
+4. Run the pipeline — all stages adapt automatically (input dimensionality is derived from the profile)
 
 ```bash
-.venv/bin/pytest -m "not integration"
+export MIMIC_PROJECT=MyNewSynth
+mimic-capture --m 10   # generates profile-appropriate Sobol vectors
 ```
 
-S05/S06 tests require torch — run under conda:
+See [docs/01-profile.md](docs/01-profile.md) for the full profile format reference, including parameter importance weighting, log-scale transforms, discrete categories, and reset values.
+
+---
+
+## Running Tests
 
 ```bash
-conda run -n mimic-synth python -m pytest tests/test_s05_surrogate.py tests/test_invert.py -v
+# Unit tests (no DawDreamer or GPU needed) — use .venv
+make test
+
+# All tests with coverage
+.venv/bin/pytest tests/unit -m "not integration" -v
+
+# Specific stage tests
+.venv/bin/pytest tests/unit/test_sampling.py -v
+.venv/bin/pytest tests/unit/test_quality.py -v
+
+# Integration tests (requires DawDreamer + VST installed) — use conda
+make test-integration
+
+# Surrogate / invert tests (require torch) — use conda
+conda run -n mimic-synth python -m pytest tests/unit/test_s05_surrogate.py -v
 ```
+
+Tests are organised as:
+
+| Test file | What it covers |
+|---|---|
+| `test_sampling.py` | Sobol sampling shape, importance weighting, log-scale |
+| `test_quality.py` | Silence / clipping / stuck / bleed detectors |
+| `test_manifest.py` | YAML manifest round-trip |
+| `test_sequences.py` | Temporal parameter trajectory generation |
+| `test_embed.py` | EnCodec shape and dtype (synthetic audio, GPU auto-skip) |
+| `test_embed_index.py` | index_dataset checkpoint/resume logic |
+| `test_s05_surrogate.py` | Surrogate forward pass, gradient flow (torch) |
+| `test_s07.py` | audio_compare scoring, mono_utils, target_analysis |
+| `test_package_structure.py` | Module imports, config attributes, directory layout |
+| `test_integration.py` | Full render via DawDreamer + OB-Xf (requires VST) |
 
 ---
 
-## Project structure
-
-```
-defaults.py                  # Data root, project name, all stage paths
-enumerate_params.py          # Utility: list all VST parameters
-build_instructions/          # Per-stage design docs (01–08)
-
-s01_profiles/
-  obxf.yaml                  # OB-Xf parameter profile
-
-s02_capture/
-  capture_v1_2.py            # Current capture rig (M=14 production)
-
-s03_dataset/
-  build_dataset.py           # Dataset builder CLI (default: post-hoc from S02_DIR; --m for live capture)
-  sampling.py                # Sobol sampling + importance weighting
-  quality.py                 # Per-capture quality gates
-  manifest.py                # Reproducibility manifest
-  sequences.py               # Temporal sequence dataset builder
-  verify_dataset.py          # Post-hoc auditor
-
-s04_embed/
-  embed.py                   # Embedder class (EnCodec 48kHz + LAION-CLAP 512-d + MRSTFT feats)
-  index_dataset.py           # Pre-compute embeddings CLI (--embed-model encodec/clap, --mrstft)
-  verify_embeddings.py       # Post-hoc embedding auditor
-
-s05_surrogate/
-  model.py                   # Surrogate (FiLM+ResBlocks or legacy MLP) + SurrogateMRSTFTHead + SurrogateDataset
-  train.py                   # Training loop CLI (--film/--no-film, --hidden-dim, --embed-model, --mrstft-features, cosine LR)
-  verify_surrogate.py        # Round-trip + sweep + gradient checks
-
-s06_invert/
-  grad_search.py             # Multi-start gradient descent
-  cmaes_search.py            # CMA-ES refinement
-  invert.py                  # End-to-end inversion CLI
-  render_stream.py           # Render best_patch.yaml via DawDreamer
-  stream_invert.py           # Sliding-window inversion for long targets
-  validate.py                # Batch validation on held-out test split
-
-s06b_live/
-  stream_invert.py           # v4 — inversion entry point; all S07 modes
-                             #   wired in via --hill-iterations / --cmaes
-
-s07_refine/
-  mono_utils.py              # ensure_mono(): stereo→mono, 3+ch raises
-  target_analysis.py         # TargetAnalysis: answers 5 design questions
-                             #   (osc type, ADSR, filter, modulation, pitch)
-  audio_compare.py           # render_trajectory() + score_audio(); applies
-                             #   profile reset values before every render
-  vst_hill_climb.py          # Strategy 1: per-param coordinate descent
-  vst_cmaes.py               # Strategy 2: osc config scouting + CMA-ES
-                             #   with IPOP restart
-
-tests/
-  test_sampling.py
-  test_quality.py
-  test_manifest.py
-  test_sequences.py
-  test_verify_dataset.py
-  test_capture_unit.py
-  test_capture_v1_2.py
-  test_embed.py
-  test_embed_index.py
-  test_s05_surrogate.py
-  test_invert.py
-  test_integration.py        # Requires DawDreamer + OB-Xf
-
-# Data lives on external drive — not in repo
-# /mnt/d/Mimic-Synth-Data/OB-X_Prototype/   (see defaults.py)
-```
-
----
-
-## Profile format
-
-```yaml
-parameters:
-  "Filter Cutoff":
-    encoding: vst
-    range: [0.0, 1.0]
-    continuous: true
-    log_scale: true     # perceptual log mapping for frequency-type params
-    importance: 1.0     # 0 = fixed at reset, 1 = full range sampled
-
-probe:
-  notes: [24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84, 87, 90, 93, 96]
-  velocity: 100
-  hold_sec: 1.5
-  release_sec: 4.5
-  sample_rate: 48000
-```
-
-`importance: 0` excludes a parameter from sampling. `log_scale: true` gives finer resolution at low values.
-
----
-
-## How inversion works
-
-The surrogate learns `f(params, note) → EnCodec latent` from captured data. Inversion asks the reverse question: given a target audio embedding, find the params that minimise cosine distance through the frozen surrogate.
-
-**S06 — single-shot inversion (offline)**
-
-```
-target.wav → EnCodec → target_embedding [128-d]
-                              ↓
-         search: find params p s.t. surrogate(p, note) ≈ target_embedding
-              ├── multi-start gradient descent (Adam, 32 starts × 500 steps)
-              └── CMA-ES refinement (seeded from best grad result)
-                              ↓
-                    best_patch.yaml  →  DawDreamer  →  rendered.wav
-```
-
-**S06b — Inversion (surrogate-driven, ~30s)**
-
-```
-target.wav  ──► mono conversion (auto)
-                      ↓
-        pyworld F0 @ 5ms (full-audio, deterministic)
-          → voiced/unvoiced tracking, no octave errors
-          → fallback: per-frame autocorrelation
-                      ↓
-        energy + pitch-jump segmentation @ 10ms → note regions
-          per region: midi_note (exact, → DawDreamer)
-                      surrogate_note (snapped to profile, → surrogate)
-                      ↓
-        per coarse frame (100ms window, 50ms hop):
-            grad_invert(surrogate, frame_emb, surrogate_note,
-                        PINNED_PARAMS = {Osc 1 Pitch=0.5,
-                                         Amp Env Release=0.2,
-                                         LFO 1 to Osc 1 Pitch=0.0})
-                      ↓
-        stream_params.parquet  +  fine_pitch_trajectory.yaml
-                      ↓
-        render (DawDreamer):
-          - MIDI file with note-on/off + pitch bend automation @ 10ms
-            (calibrated ±6st range, moves all oscillators together)
-          - per-param VST automation from stream_params
-          - reset values applied before render
-                      ↓
-        α-refinement: surrogate gradient → direction, real renders → scaling
-                      ↓
-        rendered.wav  [cosine dist ≈ 0.10]
-```
-
-**S07 — Refinement (real-VST-driven, ~5–15 min)**
-
-```
-stream_params.parquet (from S06b)
-                      ↓
-    ┌─── Strategy 1: Hill-climb (default, ~5 min) ───────────────────────┐
-    │  score = EnCodec (40%) + MRSTFT (25%) + AP (20%) + SP (15%)        │
-    │  for each unpinned param p:                                         │
-    │      for offset in [-0.15, -0.05, +0.05, +0.15]:                  │
-    │          trial = clip(all_frames[p] + offset, 0, 1)                │
-    │          score = real_render_composite(trial)                       │
-    │      keep offset that lowers score                                  │
-    │  repeat until no param improves → hill_climb_log.yaml              │
-    └────────────────────────────────────────────────────────────────────┘
-                      ↓  [cosine dist ≈ 0.09]
-    ┌─── Strategy 2: CMA-ES (--cmaes flag, ~15 min) ─────────────────────┐
-    │  target_analysis: spectral centroid → filter cutoff                 │
-    │                   ADSR shape → Amp Env Attack/Decay                 │
-    │                   harmonic ratio → resonance/cross-mod              │
-    │                   spectral flux → Filter Env Amount / LFO rate      │
-    │                   → smart x0 blended with hill-climb result         │
-    │                                                                      │
-    │  parameter space: all surrogate params + cmaes_extra_params         │
-    │      (profile-defined bounds constrain CMA-ES search range)         │
-    │                                                                      │
-    │  osc config scouting: saw / pulse / saw+pulse × short CMA-ES        │
-    │  → best config (saw+pulse won on crane scream)                       │
-    │                                                                      │
-    │  Osc 2 interval scouting: 7 discrete intervals (oct-dn / 5th-dn /  │
-    │      3rd-dn / unison / 3rd-up / 5th-up / oct-up) × short CMA-ES    │
-    │  → winning interval pinned for main CMA-ES                          │
-    │                                                                      │
-    │  CMA-ES mode (hybrid default):                                       │
-    │    Phase 1 — global: single pass over all frames (fast, ~0.029)    │
-    │    Phase 2 — per-region: fine-tune regions ≥ 400ms where it        │
-    │              beats global by >5%; crossfade at boundaries           │
-    │  IPOP restart: 1.5× population if stagnating                        │
-    │  → cmaes_log.yaml (param deltas, mode, osc config, n_renders)      │
-    └────────────────────────────────────────────────────────────────────┘
-                      ↓  [cosine dist ≈ 0.03–0.04]
-                  rendered.wav  (timestamped subfolder)
-```
-
-`PINNED_PARAMS` is enforced at every stage. Without them the optimizer shifts pitch +24 semitones and holds notes indefinitely — both produce lower embedding distance but completely wrong audio.
-
-Output is synth knob positions (0–1 per parameter). Load `best_patch.yaml` onto the synth and play the recovered MIDI note to hear the result.
-
----
-
----
-
-## Accuracy improvements — quality roadmap
-
-The current pipeline produces a recognizable approximation of the source: correct rhythm, correct pitch regions, some timbral overlap. Several root causes limit quality and point to concrete improvements:
+## Roadmap
 
 ### Richer synthesis
+- [ ] Hardware synth support via MIDI + audio interface loopback (profile-driven, no DawDreamer)
+- [ ] Multi-timbral profiles (split / layer modes)
+- [ ] Parameter macro groups (e.g. "brightness", "warmth") in profile
 
-The surrogate was trained on static single-note patches. The most impactful changes require no retraining:
+### Better analysis
+- [x] pyworld F0 / aperiodicity / spectral envelope
+- [x] Calibrated filter cutoff from measured sweep
+- [x] Amplitude envelope scoring (Pearson correlation)
+- [ ] Onset / transient feature extraction for percussive targets
+- [ ] Longer-context temporal modelling (LFO shapes, filter sweeps)
 
-- ~~**Per-frame Filter Cutoff automation**~~ **Done.** pyworld SP + librosa centroid → per-frame trajectory written to `stream_params.parquet`, with crossfade at note boundaries.
-- ~~**Oscillator interval snapping**~~ **Done.** `_scout_osc2_intervals` in `vst_cmaes.py` tries 7 discrete intervals (oct-dn through oct-up) before the main CMA-ES; winner is pinned.
-- **Unison voices** — Unison Detune at 0.2–0.4 immediately makes any patch sound denser. Should be near-default, not CMA-ES-discovered.
-- **Noise burst at attack** — route noise through a fast-decay envelope (short Filter Env Decay at high Filter Env Amount). Gives the percussive "click" at note onset most organic sounds have.
+### Better optimisation
+- [x] CMA-ES with IPOP restart
+- [x] Oscillator config scouting (saw / pulse / saw+pulse)
+- [x] Osc 2 interval scouting (7 discrete musical intervals)
+- [x] Calibrated filter-cutoff warm-start
+- [ ] Population seeding from nearest-neighbour in embedding space
+- [ ] Multi-objective Pareto front (timbral match vs. playability)
 
-### Better target analysis
-
-The current `target_analysis.py` answers 5 heuristic design questions. Grounding them in signal analysis would give more reliable warm-starts:
-
-- **pyworld spectral envelope (SP)** as a direct filter target — SP is the smooth spectral shape per frame and maps directly to Filter Cutoff trajectory and Filter Resonance. Already available from `pyworld.wav2world()`, which the pipeline calls for F0/AP.
-- **Attack transient decomposition** — `_detect_transient_min_ms()` in `target_analysis.py` uses librosa onset detection; the minimum inter-onset interval sets a per-target dynamic upper bound on Amp Env Attack in `cmaes_refine()`, replacing the previous static bound.
-- **Harmonic structure classification** — use pyworld aperiodicity (AP) mean to gate oscillator selection explicitly: AP < 0.2 → saw/saw+pulse, AP 0.2–0.5 → saw+pulse + noise, AP > 0.5 → noise-dominant. Currently implicit in CMA-ES scoring.
-- **Inharmonicity fingerprinting** — measure deviation of spectral peaks from integer ratios. Gives a direct objective for Ring Mod and Cross Modulation depth, which currently only emerge by accident.
-
-### Better scoring
-
-- ~~**MRSTFT auxiliary loss during surrogate training**~~ **Done.** `SurrogateMRSTFTHead` predicts 1924-d spectral features (weighted 0.1×) during training; excluded from `state_dict.pt` so inference is unchanged. Requires `mrstft_features.npy` from S04 (`--mrstft`).
-- **Per-frame SP distance** — `SP_WEIGHT = 0.15` in `audio_compare.py`; composite is `0.40×EnCodec + 0.25×MRSTFT + 0.20×AP + 0.15×SP`. Directly rewards the optimizer for matching filter movement frame-by-frame.
-- **Pitch-invariant timbral scoring** — pitch-shift the render to match the source before embedding, so cosine distance measures timbre rather than penalizing small pitch errors.
-- **LUFS normalization** — `_lufs_normalize()` in `audio_compare.py`; applied before all scoring comparisons.
-
-### Better optimization
-
-- **Hierarchical search** — separate coarse (discrete: oscillator type, Osc 2 interval, ring mod on/off) from medium (ADSR set analytically from target waveform) from fine (CMA-ES on the remaining 8–10 parameters). Shrinks the effective CMA-ES search space 3–5×.
-- **DDSP analysis as CMA-ES warm-start** — Google's DDSP extracts continuous filter cutoff and harmonic amplitude trajectories analytically. Using those as x0 instead of the current target_analysis heuristics would give dramatically better convergence.
-- **Surrogate retrained on production data** — after capture completes, rebuild S03 → S04 → S05. The surrogate's input dimension is read directly from the profile, so adding parameters to `obxf.yaml` automatically expands the model on the next train. New arch (FiLM+ResBlocks, `hidden_dim=1024`) is the default since PR #1.
-
-### Offline synth calibration
-
-~~One-time parameter sweeps through OB-Xf~~ **Done.** `calibrate_synth.py` sweeps Filter Cutoff 0→1 and writes `s07_refine/obxf_calibration.npz`. Both `_centroid_hz_to_filter_cutoff` (stream_invert.py) and `target_analysis.py` now load this table via `np.interp`. Run once after installing the plugin: `conda run -n mimic-synth python calibrate_synth.py`
+### Deployment
+- [ ] ONNX export for inference without PyTorch
+- [ ] nn~ / Max/MSP integration (S08)
+- [ ] Web demo
 
 ---
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

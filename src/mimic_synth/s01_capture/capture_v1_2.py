@@ -35,7 +35,7 @@ from tqdm import tqdm
 # Allow running as `python s02_capture/capture_v1_2.py` from the repo root
 # or as `python capture_v1_2.py` from inside s02_capture/
 # sys.path.insert removed — installed via pyproject.toml
-from mimic_synth.config import PROFILE_PATH, S02_DIR, S02_WAV_DIR, S02_PARQUET, SAMPLE_RATE, BUFFER_SIZE
+from mimic_synth.config import PROFILE_PATH, S02_DIR, S02_WAV_DIR, S02_PARQUET, SAMPLE_RATE, BUFFER_SIZE, PROJECT_DIR
 
 M = 14                       # Sobol exponent: 2^M vectors (14 → 16,384 vectors)
 OUT_DIR      = S02_DIR
@@ -386,7 +386,7 @@ def main():
             rows.append({
                 "hash": h,
                 "note": note,
-                "wav": str(wav_path),
+                "wav": str(wav_path.relative_to(PROJECT_DIR)),
                 "self_noise": self_noise,
                 **{f"p_{k}": v for k, v in params_dict.items()},
             })
