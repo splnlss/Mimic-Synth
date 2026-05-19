@@ -473,8 +473,13 @@ def suggest_x0(
         # it will take effect directly.
         "Amp Env Release":  _release_ms_to_param(analysis.release_ms),
         # Q4 — LFO
-        "LFO 1 Rate":         analysis.lfo_rate_est,
-        "LFO 1 to Filter Cutoff": analysis.lfo_to_filter_est,
+        # For sustained targets with spectral flux, a near-zero LFO rate with
+        # high filter depth produces a slow brightness sweep rather than vibrato.
+        # This matches natural tonal evolution better than a periodic LFO.
+        "LFO 1 Rate": 0.05 if analysis.sustain_level > 0.2 else analysis.lfo_rate_est,
+        "LFO 1 to Filter Cutoff": float(np.clip(
+            analysis.spectral_flux_norm * 0.8, 0.0, 0.8
+        )) if analysis.sustain_level > 0.2 else analysis.lfo_to_filter_est,
         # Q1/Q5 — oscillator
         "Osc 2 Detune":       analysis.osc2_detune_est,
         "Cross Modulation":   analysis.cross_mod_est,

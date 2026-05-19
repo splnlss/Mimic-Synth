@@ -135,11 +135,11 @@ def _lufs_normalize(audio: np.ndarray, sr: int) -> np.ndarray:
 # MRSTFT: temporal spectral variation — filter sweeps, attack/release character.
 # AP (aperiodicity): noise-vs-harmonic balance — "squaky", breathy, inharmonic content.
 # When a term is unavailable (e.g. pyworld not installed), weights are renormalised.
-ENCODEC_WEIGHT: float = 0.36  # roadmap §III.A revised weights
-MRSTFT_WEIGHT:  float = 0.23
-AP_WEIGHT:      float = 0.18
+ENCODEC_WEIGHT: float = 0.33  # roadmap §III.A revised weights
+MRSTFT_WEIGHT:  float = 0.22
+AP_WEIGHT:      float = 0.17
 SP_WEIGHT:      float = 0.13  # per-frame spectral envelope (pyworld CheapTrick)
-ENV_WEIGHT:     float = 0.10  # amplitude envelope correlation (attack/sustain/release shape)
+ENV_WEIGHT:     float = 0.15  # amplitude envelope correlation (attack/sustain/release shape)
 
 
 _MRSTFT_N_TERMS = 2 * len([256, 512, 1024, 2048])  # SpectralConvergence + LogMagnitude per scale = 8

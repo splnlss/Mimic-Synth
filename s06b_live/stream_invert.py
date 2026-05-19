@@ -752,6 +752,143 @@ def grad_invert(
     return best_score, best_params
 
 
+# ── Run settings log ─────────────────────────────────────────────────────────
+
+def _write_settings_md(
+    run_dir: Path,
+    target_wav: Path,
+    profile_path: Path,
+    surrogate_checkpoint: Path,
+    note_regions: list,
+    hill_iterations: int,
+    run_cmaes: bool,
+    cmaes_mode: str,
+    cmaes_osc_config: str | None,
+    cmaes_sigma0: float,
+    cmaes_popsize: int,
+    cmaes_maxiter: int,
+    audio_duration: float,
+) -> None:
+    """Write settings.md to run_dir recording the command, settings, and results."""
+    from s07_refine.audio_compare import (
+        ENCODEC_WEIGHT, MRSTFT_WEIGHT, AP_WEIGHT, SP_WEIGHT, ENV_WEIGHT
+    )
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    command = " ".join(_sys.argv)
+
+    # Determine which stages ran
+    if run_cmaes:
+        stage = f"CMA-ES ({cmaes_mode})"
+    elif hill_iterations > 0:
+        stage = f"Hill-climb ({hill_iterations} pass(es))"
+    else:
+        stage = "Surrogate + α-refinement only"
+
+    # Read final scores from written artifacts
+    surrogate_score = hill_score = cmaes_score = None
+    osc_config_used = cmaes_osc_config or "scouted"
+    n_renders = restarts = None
+
+    bp_path = run_dir / "best_patch.yaml"
+    if bp_path.exists():
+        with open(bp_path) as f:
+            bp = yaml.safe_load(f)
+        surrogate_score = bp.get("score")
+        cmaes_score     = bp.get("cmaes_global_score")
+        osc_config_used = bp.get("osc_config", osc_config_used)
+
+    hc_path = run_dir / "hill_climb_log.yaml"
+    if hc_path.exists():
+        with open(hc_path) as f:
+            hc = yaml.safe_load(f)
+        hill_score = hc.get("final_score")
+
+    cl_path = run_dir / "cmaes_log.yaml"
+    if cl_path.exists():
+        with open(cl_path) as f:
+            cl = yaml.safe_load(f)
+        cmaes_score     = cl.get("global_score", cmaes_score)
+        osc_config_used = cl.get("osc_config", osc_config_used)
+        n_renders       = cl.get("n_renders")
+        restarts        = cl.get("restarts_used")
+
+    # Summarise note regions
+    region_lines = []
+    for i, r in enumerate(note_regions):
+        dur = r["offset_sec"] - r["onset_sec"]
+        region_lines.append(
+            f"  {i+1}. MIDI {r['midi_note']} ({r.get('median_hz', 0):.0f} Hz)  "
+            f"{r['onset_sec']:.3f}–{r['offset_sec']:.3f}s  ({dur*1000:.0f} ms)"
+        )
+
+    # Final score (best available)
+    final_score = cmaes_score or hill_score or surrogate_score
+
+    lines = [
+        "# Run Settings",
+        "",
+        f"**Timestamp:** {timestamp}",
+        f"**Target:** {target_wav.name}",
+        f"**Duration:** {audio_duration:.3f}s" if audio_duration else "",
+        f"**Output:** {run_dir}",
+        "",
+        "## Command",
+        "",
+        "```",
+        command,
+        "```",
+        "",
+        "## Pipeline",
+        "",
+        f"- Stage: {stage}",
+    ]
+
+    if run_cmaes:
+        lines += [
+            f"- Osc config: {osc_config_used}",
+            f"- CMA-ES: sigma0={cmaes_sigma0}, popsize={cmaes_popsize}, maxiter={cmaes_maxiter}",
+        ]
+        if n_renders is not None:
+            lines.append(f"- Renders: {n_renders}  |  IPOP restarts: {restarts}")
+
+    lines += [
+        f"- Profile: {profile_path}",
+        f"- Surrogate: {surrogate_checkpoint}",
+        "",
+        "## Scores",
+        "",
+    ]
+
+    if surrogate_score is not None:
+        lines.append(f"- Surrogate (embedding cosine dist): {surrogate_score:.4f}")
+    if hill_score is not None:
+        lines.append(f"- Hill-climb (composite):            {hill_score:.4f}")
+    if cmaes_score is not None:
+        lines.append(f"- CMA-ES (composite):                {cmaes_score:.4f}")
+    if final_score is not None:
+        lines.append(f"- **Final: {final_score:.4f}**")
+
+    lines += [
+        "",
+        "## Scoring weights",
+        "",
+        f"EnCodec {ENCODEC_WEIGHT*100:.0f}%  |  "
+        f"MRSTFT {MRSTFT_WEIGHT*100:.0f}%  |  "
+        f"AP {AP_WEIGHT*100:.0f}%  |  "
+        f"SP {SP_WEIGHT*100:.0f}%  |  "
+        f"Env {ENV_WEIGHT*100:.0f}%",
+        "",
+        "## Note regions detected",
+        "",
+    ]
+    lines += region_lines if region_lines else ["  (none)"]
+
+    lines += ["", "## Notes", "", ""]
+
+    (run_dir / "settings.md").write_text("\n".join(lines))
+
+
 # ── Main inversion ───────────────────────────────────────────────────────────
 
 def stream_invert(
@@ -1108,6 +1245,22 @@ def stream_invert(
                 audio=audio,
                 sr=sr,
             )
+
+    _write_settings_md(
+        run_dir=run_dir,
+        target_wav=target_wav,
+        profile_path=profile_path,
+        surrogate_checkpoint=surrogate_checkpoint,
+        note_regions=note_regions,
+        hill_iterations=hill_iterations,
+        run_cmaes=run_cmaes,
+        cmaes_mode=cmaes_mode,
+        cmaes_osc_config=cmaes_osc_config,
+        cmaes_sigma0=cmaes_sigma0,
+        cmaes_popsize=cmaes_popsize,
+        cmaes_maxiter=cmaes_maxiter,
+        audio_duration=audio_duration,
+    )
 
     return {"df": df, "best": best_row, "run_dir": run_dir}
 

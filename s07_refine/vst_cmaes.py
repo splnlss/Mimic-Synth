@@ -217,7 +217,7 @@ def cmaes_refine(
         f"p_{name}": (cfg["lo"], cfg["hi"])
         for name, cfg in extra_param_meta.items()
     }
-    extra_bounds["p_Amp Env Release"] = (0.0, 0.35)
+    extra_bounds["p_Amp Env Release"] = (0.0, 0.15)
 
     # Dynamic Amp Env Attack bound: transient_min_ms * 0.5 gives the maximum
     # attack time the synth can have and still respond within each transient.
@@ -387,7 +387,7 @@ def _run_global(
     def _ckpt(best_x: np.ndarray, score: float) -> None:
         if on_improvement is not None:
             ckpt_df = _apply_global_offsets(
-                df, best_x, free_cols, x0_median, all_param_cols, pinned_cols
+                df, best_x, free_cols, x0_median, all_param_cols, pinned_cols, extra_bounds
             )
             on_improvement(ckpt_df, score)
 
@@ -395,7 +395,7 @@ def _run_global(
         objective=lambda x: _score_global(
             x, free_cols, pinned_cols, x0_median, df, all_param_cols,
             note_regions, profile_path, total_sec, target_emb_t, embedder, device,
-            extra_osc, target_mrstft_audio, target_ap, target_sp,
+            extra_osc, target_mrstft_audio, target_ap, target_sp, extra_bounds,
         ),
         x0=x0_free, n_dims=len(x0_free), bounds=(lo, hi),
         sigma0=sigma0, popsize=popsize, maxiter=maxiter,
@@ -403,7 +403,7 @@ def _run_global(
         on_improvement=_ckpt,
     )
 
-    result_df = _apply_global_offsets(df, best_x, free_cols, x0_median, all_param_cols, pinned_cols)
+    result_df = _apply_global_offsets(df, best_x, free_cols, x0_median, all_param_cols, pinned_cols, extra_bounds)
 
     audio, sr = render_trajectory(result_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
     global_score = score_audio_composite(audio, sr, target_emb_t, embedder, device, target_mrstft_audio, target_ap, target_sp)
@@ -710,7 +710,7 @@ def _run_cmaes_once(
         idx = int(np.argmin(scores))
         if scores[idx] < best_score:
             best_score = scores[idx]
-            best_x = np.array(xs[idx]).clip(0.0, 1.0)
+            best_x = np.clip(np.array(xs[idx]), lo, hi)
 
         log.append({"iter": len(log), "best": float(best_score), "sigma": float(es.sigma)})
         pbar.update(1)
@@ -729,8 +729,9 @@ def _score_global(
     x_free, free_cols, pinned_cols, x0_median, df, all_param_cols,
     note_regions, profile_path, total_sec, target_emb_t, embedder, device,
     extra_osc, target_mrstft_audio=None, target_ap=None, target_sp=None,
+    extra_bounds=None,
 ) -> float:
-    trial_df = _apply_global_offsets(df, x_free, free_cols, x0_median, all_param_cols, pinned_cols)
+    trial_df = _apply_global_offsets(df, x_free, free_cols, x0_median, all_param_cols, pinned_cols, extra_bounds)
     audio, sr = render_trajectory(trial_df, note_regions, all_param_cols, profile_path, total_sec, extra_osc)
     return score_audio_composite(audio, sr, target_emb_t, embedder, device, target_mrstft_audio, target_ap, target_sp)
 
@@ -755,14 +756,16 @@ def _score_region(
 
 def _apply_global_offsets(
     df, x_free, free_cols, x0_median, all_param_cols, pinned_cols,
+    extra_bounds: dict[str, tuple[float, float]] | None = None,
 ) -> pd.DataFrame:
     """Apply global per-param offsets uniformly across all frames."""
     result_df = df.copy()
     for i, col in enumerate(free_cols):
-        new_val = float(np.clip(x_free[i], 0.0, 1.0))
+        lo, hi = (extra_bounds or {}).get(col, (0.0, 1.0))
+        new_val = float(np.clip(x_free[i], lo, hi))
         delta = new_val - x0_median.get(col, 0.5)
         if col in result_df.columns:
-            result_df[col] = np.clip(result_df[col] + delta, 0.0, 1.0)
+            result_df[col] = np.clip(result_df[col] + delta, lo, hi)
         else:
             result_df[col] = new_val
     return result_df
@@ -848,6 +851,7 @@ def _scout_osc_configs(
                 x, free_cols, pinned_cols, x0_median, df, all_param_cols,
                 note_regions, profile_path, total_sec, target_emb_t, embedder, device, _osc,
                 target_mrstft_audio=target_mrstft_audio, target_ap=target_ap, target_sp=target_sp,
+                extra_bounds=extra_bounds,
             ),
             x0=x0_free.copy(), n_dims=len(x0_free), bounds=(lo_s, hi_s),
             sigma0=sigma0, popsize=SCOUT_POPSIZE, maxiter=SCOUT_MAXITER,
@@ -901,6 +905,7 @@ def _scout_osc2_intervals(
                 x, free_cols, pinned_with_osc2, x0_median, df, all_param_cols,
                 note_regions, profile_path, total_sec, target_emb_t, embedder, device, _osc,
                 target_mrstft_audio=target_mrstft_audio, target_ap=target_ap, target_sp=target_sp,
+                extra_bounds=extra_bounds,
             ),
             x0=x0_free.copy(), n_dims=len(x0_free), bounds=(lo_s, hi_s),
             sigma0=sigma0, popsize=SCOUT_POPSIZE, maxiter=SCOUT_MAXITER,
